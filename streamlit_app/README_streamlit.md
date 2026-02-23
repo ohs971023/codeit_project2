@@ -2,10 +2,8 @@
 
 ## 실행
 ```bash
-python -m venv .venv_streamlit
-source .venv_streamlit/bin/activate
-
 pip install -r streamlit_app/requirements_streamlit.txt
 python -m pip install faiss-cpu
 
 streamlit run streamlit_app/app.py
+uv run streamlit run streamlit_app/app.py
