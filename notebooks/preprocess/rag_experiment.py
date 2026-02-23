@@ -23,12 +23,13 @@ from rapidfuzz import fuzz
 
 from preprocess.pp_basic import EVAL_DIR
 
-# ✅ ImportError만 fallback (pp_v5가 "없을 때"만 pp_v4 사용)
 try:
-    from preprocess import pp_v5 as pp
-except ImportError as e:  # v5 배포 전/백업
-    print("[WARN] pp_v5 import 실패(ImportError), pp_v4로 fallback:", repr(e))
-    from preprocess import pp_v4 as pp
+    from preprocess import pp_v6 as pp
+except ImportError:
+    try:
+        from preprocess import pp_v5 as pp
+    except ImportError:  # v5/v6 미배포 전 백업
+        from preprocess import pp_v4 as pp
 
 ALL_DATA = getattr(pp, "ALL_DATA", None)
 clean_text = pp.clean_text
