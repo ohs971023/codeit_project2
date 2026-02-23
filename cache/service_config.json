@@ -1,0 +1,12 @@
+{
+  "pp_version": "pp_v5",
+  "chunk_length": 1200,
+  "top_k": 3,
+  "alpha": 0.7,
+  "max_context_chars": 2500,
+  "max_completion_tokens": 2496,
+  "temperature": 0.1,
+  "confirmed_max": 1,
+  "candidate_max": 12,
+  "max_pages_scan": 260
+}
