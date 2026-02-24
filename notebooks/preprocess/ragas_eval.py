@@ -32,14 +32,23 @@ def load_gold_fields_jsonl(path: str | Path) -> pd.DataFrame:
       {"instance_id": "...", "doc_id": "...", "fields": {"fieldA": "goldA", ...}}
     -> long df:
       instance_id, doc_id, field, gold
+
+    ✅ BOM(utf-8-sig) 안전 대응
     """
     path = Path(path)
     rows = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+
+    # 핵심: utf-8-sig로 BOM 제거
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
-            if line:
-                rows.append(json.loads(line))
+            if not line:
+                continue
+            # 혹시 라인 앞에 BOM이 남아있을 수 있어 재차 제거
+            line = line.lstrip("\ufeff").strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
 
     out = []
     for r in rows:
@@ -184,8 +193,17 @@ def run_ragas_gpt5(
 ) -> pd.DataFrame:
     """
     GPT-5 Responses API로 RAGAS 스타일 지표(3개)를 계산.
-    - temperature 파라미터를 사용하지 않음 (GPT-5 제약 회피)
+    ✅ rows가 비어있거나 judge 실패해도 '스키마 고정 DF'를 반환하도록 보장.
     """
+    expected_cols = [
+        "exp_id", "chunker", "retriever", "generator",
+        "doc_id", "field", "user_input",
+        "faithfulness", "context_precision", "answer_correctness",
+    ]
+
+    if not rows:
+        return pd.DataFrame(columns=expected_cols)
+
     out_rows: List[Dict[str, Any]] = []
 
     for r in tqdm(rows, desc="GPT-5 judge scoring"):
@@ -208,7 +226,6 @@ def run_ragas_gpt5(
         faith = None
         cprec = None
         acorr = None
-        raw_text = ""
 
         try:
             resp = client.responses.create(
@@ -218,15 +235,15 @@ def run_ragas_gpt5(
                 reasoning={"effort": reasoning_effort},
             )
             raw_text = (getattr(resp, "output_text", "") or "").strip()
-
             obj = json.loads(raw_text)
+
             faith = _clip01(obj.get("faithfulness"))
             cprec = _clip01(obj.get("context_precision"))
             acorr = obj.get("answer_correctness")
             acorr = None if acorr is None else _clip01(acorr)
 
         except Exception:
-            # 실패하면 NaN(None)로 둠 (전체 실행이 죽지 않게)
+            # 실패하면 None 유지
             pass
 
         out_rows.append(
@@ -241,12 +258,16 @@ def run_ragas_gpt5(
                 "faithfulness": faith,
                 "context_precision": cprec,
                 "answer_correctness": acorr,
-                # 디버그가 필요하면 아래를 저장해도 됨(용량 커질 수 있음)
-                # "judge_raw": raw_text[:500],
             }
         )
 
-    return pd.DataFrame(out_rows)
+    df = pd.DataFrame(out_rows)
+
+    # ✅ 컬럼 누락 방지: expected_cols가 없으면 생성
+    for c in expected_cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[expected_cols].copy()
 
 
 # ------------------------------------------------------------
@@ -254,18 +275,14 @@ def run_ragas_gpt5(
 # ------------------------------------------------------------
 @dataclass
 class RagasRunResult:
-    # 기존(ret/gen) 문서 단위 DF
     doc_metrics_df: pd.DataFrame
-    # 질문 단위 RAGAS 점수 DF (doc_id/field 단위)
     ragas_sample_df: pd.DataFrame
-    # 문서 단위 평균 RAGAS DF
     ragas_doc_df: pd.DataFrame
-    # exp 단위 평균 RAGAS DF
     ragas_exp_df: pd.DataFrame
 
 
 # ------------------------------------------------------------
-# Main entry for exp_notebook (one-call)
+# Main entry
 # ------------------------------------------------------------
 def run_experiment_with_ragas(
     spec: ExperimentSpec,
@@ -274,24 +291,14 @@ def run_experiment_with_ragas(
     embed_model: SentenceTransformer,
     client: OpenAI,
     evaluator_model: str = "gpt-5-mini",
-    ragas_metrics: Optional[List[str]] = None,  # 현재는 3개만 지원
+    ragas_metrics: Optional[List[str]] = None,
     compute_baseline_doc_metrics: bool = True,
     gold_evidence_df: Optional[pd.DataFrame] = None,
     sim_threshold: int = 80,
-    # judge 옵션
     judge_max_context_chars_per_sample: int = 6000,
     judge_max_output_tokens: int = 500,
     judge_reasoning_effort: str = "minimal",
 ) -> RagasRunResult:
-    """
-    exp_notebook에서 한 번에 호출:
-    - 같은 spec/run_docs/CONFIG로 RAG 실행
-    - (옵션) 기존 ret/gen 문서 지표 계산
-    - 같은 실행 결과로 RAGAS 스타일 지표(3개)를 GPT-5로 평가
-
-    주의:
-    - ragas_metrics는 현재 ["faithfulness","context_precision","answer_correctness"]만 지원(temperature 이슈 회피 목적)
-    """
     if ragas_metrics is None:
         ragas_metrics = ["faithfulness", "context_precision", "answer_correctness"]
 
@@ -335,18 +342,23 @@ def run_experiment_with_ragas(
         reasoning_effort=judge_reasoning_effort,
     )
 
-    # (필요한 metric만 남기기)
+    # ✅ keep_cols 방어: 없으면 만들어서 KeyError 방지
     keep_cols = ["exp_id","chunker","retriever","generator","doc_id","field","user_input"] + ragas_metrics
+    for c in keep_cols:
+        if c not in ragas_sample_df.columns:
+            ragas_sample_df[c] = None
     ragas_sample_df = ragas_sample_df[keep_cols].copy()
 
     # 3) doc-level avg
-    ragas_doc_df = ragas_sample_df.groupby("doc_id")[ragas_metrics].mean(numeric_only=True).reset_index()
+    if len(ragas_sample_df) == 0:
+        ragas_doc_df = pd.DataFrame(columns=["doc_id"] + ragas_metrics)
+        ragas_exp_df = pd.DataFrame([{"exp_id": spec.exp_id, **{m: float("nan") for m in ragas_metrics}}])
+    else:
+        ragas_doc_df = ragas_sample_df.groupby("doc_id")[ragas_metrics].mean(numeric_only=True).reset_index()
+        exp_avg = ragas_sample_df[ragas_metrics].mean(numeric_only=True)
+        ragas_exp_df = pd.DataFrame([{"exp_id": spec.exp_id, **{k: float(exp_avg[k]) for k in exp_avg.index}}])
 
-    # 4) exp-level avg
-    exp_avg = ragas_sample_df[ragas_metrics].mean(numeric_only=True)
-    ragas_exp_df = pd.DataFrame([{"exp_id": spec.exp_id, **{k: float(exp_avg[k]) for k in exp_avg.index}}])
-
-    # 5) baseline doc metrics (optional)
+    # 4) baseline doc metrics (optional)
     if compute_baseline_doc_metrics:
         if gold_evidence_df is None:
             raise ValueError("compute_baseline_doc_metrics=True면 gold_evidence_df를 넘겨줘야 함")

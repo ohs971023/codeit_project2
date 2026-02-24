@@ -4,7 +4,7 @@
 CONFIG = {
     "pp_version": "pp_v5",
     "chunk_length": 1200,
-    "top_k": 5,
+    "top_k": 20,
     "max_tokens": 2000,
     "max_completion_tokens": 2496,
     "temperature": 0.1,

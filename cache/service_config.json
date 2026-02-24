@@ -1,7 +1,7 @@
 {
   "pp_version": "pp_v5",
   "chunk_length": 1200,
-  "top_k": 5,
+  "top_k": 20,
   "alpha": 0.7,
   "max_context_chars": 4100,
   "max_completion_tokens": 2496,

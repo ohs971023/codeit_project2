@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -51,7 +52,7 @@ DEFAULT_CFG = {
 WEAK_KEYWORDS = ["예산", "사업비", "소요예산", "부가가치세", "VAT", "계약", "입찰", "기간", "마감", "제출", "기관", "요구사항"]
 
 # ----------------------------
-# module caches
+# small caches
 # ----------------------------
 @st.cache_resource(show_spinner=False)
 def cached_import(module_name: str):
@@ -135,39 +136,15 @@ def switch_doc(doc_id: str):
         st.session_state["messages"] = st.session_state["doc_messages"].get(doc_id, [])
         st.session_state["active_doc"] = doc_id
 
-        # 문서 바꾸면 렌더/근거 상태 초기화
-        for k in [
-            "svc_render_phys",
-            "svc_confirmed_pages",
-            "svc_candidate_pages",
-            "svc_highlight_queries",
-            "svc_pending_phys",
-            "svc_pending_apply",
-            "svc_pv_page_input",
-        ]:
-            st.session_state.pop(k, None)
-
 # =========================================================
 # Retrieval helpers
 # =========================================================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
-def clean_answer_remove_page_lines(answer: str) -> str:
-    """
-    채팅 답변에서 근거 페이지/페이지 표기를 제거.
-    (LLM이 '근거 페이지: ...'를 쓰더라도 UI에서만 보여주고 채팅에는 숨김)
-    """
-    a = answer or ""
-    a = re.sub(r"(?m)^\s*근거\s*페이지\s*:\s*.*$", "", a)
-    a = re.sub(r"(?m)^\s*근거\s*페이지\s*.*$", "", a)
-    # 빈 줄 정리
-    a = re.sub(r"\n{3,}", "\n\n", a).strip()
-    return a
-
 def provisional_pages_from_results(results: list, max_pages: int = 3) -> List[int]:
     pages = []
-    for r in (results or [])[:10]:
+    for r in (results or [])[:5]:
         try:
             p = int(getattr(r.chunk, "page", 0) or 0)
         except Exception:
@@ -236,9 +213,7 @@ def pick_pages_confirmed_candidate(
     hit_map = {}
     if strong_queries:
         try:
-            hit_map = find_pages_with_hit_counts(
-                pdf_path, strong_queries, start_page=start_page, max_pages_scan=max_pages_scan
-            )
+            hit_map = find_pages_with_hit_counts(pdf_path, strong_queries, start_page=start_page, max_pages_scan=max_pages_scan)
         except Exception:
             hit_map = {}
 
@@ -250,23 +225,12 @@ def pick_pages_confirmed_candidate(
         confirmed = (fallback_pages or [])[:confirmed_max]
         if weak_queries:
             try:
-                candidate = find_pages_for_queries(
-                    pdf_path, weak_queries, start_page=start_page, max_pages_scan=max_pages_scan
-                )
+                candidate = find_pages_for_queries(pdf_path, weak_queries, start_page=start_page, max_pages_scan=max_pages_scan)
             except Exception:
                 candidate = []
 
     candidate = [p for p in candidate if p not in confirmed][:candidate_max]
     return confirmed, candidate
-
-def sync_auto_navigate(target_phys: int, start_page: int, n_pages: int):
-    """
-    자동 이동은 위젯 key(svc_pv_page_input)를 직접 수정하면 Streamlit 오류가 나므로,
-    pending 값을 설정하고 rerun -> 다음 run에서 위젯 생성 전에 반영한다.
-    """
-    target_phys = max(1, min(int(target_phys), int(n_pages)))
-    st.session_state["svc_pending_phys"] = target_phys
-    st.session_state["svc_pending_apply"] = True
 
 # ----------------------------
 # UI
@@ -295,68 +259,49 @@ with tab_service:
 
         switch_doc(doc_id)
 
-        confirmed_pages = st.session_state.get("svc_confirmed_pages", []) or []
-        candidate_pages = st.session_state.get("svc_candidate_pages", []) or []
-        highlight_queries = st.session_state.get("svc_highlight_queries", []) or []
+        confirmed_pages = st.session_state.get("svc_confirmed_pages", [])
+        candidate_pages = st.session_state.get("svc_candidate_pages", [])
+        highlight_queries = st.session_state.get("svc_highlight_queries", [])
 
         start_page = get_start_page(doc_id)
         front_pages = get_front_pages(doc_id)
         offset = start_page - 1
 
-        # 확정 근거 페이지 UI 숨김(요구사항)
-        # 후보 페이지는 이미지 아래에서 표시
+        def to_content(pages: List[int]) -> List[int]:
+            return [p - offset for p in pages]
+
+        st.markdown("**✅ 확정 근거 페이지(하이라이트 가능)**")
+        st.write(to_content(confirmed_pages) if confirmed_pages else [])
+
+        st.markdown("**🟡 후보 페이지(하이라이트 없음)**")
+        st.write(to_content(candidate_pages) if candidate_pages else [])
 
         try:
             n_pages = get_pdf_num_pages(pdf_path)
         except Exception:
             n_pages = 1
 
-        # ✅ pending nav 적용 (위젯 생성 전에 적용해야 Streamlit 에러 없음)
-        if st.session_state.get("svc_pending_apply"):
-            target_phys = int(st.session_state.get("svc_pending_phys", start_page))
-            target_phys = max(1, min(target_phys, int(n_pages)))
-            st.session_state["svc_render_phys"] = target_phys
-
-            content_max = max(1, n_pages - offset)
-            content_p = target_phys - offset
-            if content_p < 1:
-                content_p = 1
-            if content_p > content_max:
-                content_p = content_max
-
-            st.session_state["svc_pv_page_input"] = int(content_p)
-            st.session_state["svc_pending_apply"] = False
-
         show_hl = st.checkbox("하이라이트 보기(확정 페이지에서만)", value=True, disabled=(not confirmed_pages))
 
-        # 앞부분 버튼
+        # ✅ 앞부분 버튼
         if front_pages:
             st.caption("앞부분 바로 보기")
             btn_cols = st.columns(len(front_pages))
             for col, (phys_p, lbl) in zip(btn_cols, front_pages):
                 if col.button(lbl, key=f"svc_front_{phys_p}"):
-                    sync_auto_navigate(phys_p, start_page, n_pages)
-                    st.rerun()
+                    st.session_state["svc_render_phys"] = phys_p
 
-        # 본문 페이지 입력(자동 이동 + 수동 이동 모두 가능)
         content_max = max(1, n_pages - offset)
+        base_pages = confirmed_pages if confirmed_pages else candidate_pages
 
-        # default: widget 값이 있으면 그것, 없으면 확정/후보/1
-        if "svc_pv_page_input" in st.session_state:
-            default_content_p = int(st.session_state["svc_pv_page_input"])
-        elif confirmed_pages:
-            default_content_p = max(1, min(int(confirmed_pages[0]) - offset, content_max))
-        elif candidate_pages:
-            default_content_p = max(1, min(int(candidate_pages[0]) - offset, content_max))
+        cur_phys = st.session_state.get("svc_render_phys")
+        if cur_phys is not None and start_page <= cur_phys <= n_pages:
+            default_content_p = cur_phys - offset
+        elif base_pages:
+            default_content_p = max(1, base_pages[0] - offset)
         else:
             default_content_p = 1
-
         default_content_p = max(1, min(default_content_p, content_max))
-
-        def _svc_page_changed():
-            # 사용자가 본문 번호를 바꾸면 즉시 이동
-            target_phys = int(st.session_state["svc_pv_page_input"]) + offset
-            st.session_state["svc_render_phys"] = int(target_phys)
 
         st.number_input(
             f"본문 페이지 (1..{content_max})",
@@ -364,59 +309,39 @@ with tab_service:
             max_value=content_max,
             value=default_content_p,
             step=1,
-            key="svc_pv_page_input",
-            on_change=_svc_page_changed,
+            key="svc_pv_page",
         )
 
-        # 렌더 대상 물리 페이지
+        # ✅ 페이지 보기 버튼 추가
+        if st.button("페이지 보기", key="svc_render_btn"):
+            st.session_state["svc_render_phys"] = int(st.session_state["svc_pv_page"]) + offset
+
         page_to_view = st.session_state.get("svc_render_phys")
         if page_to_view is None:
-            page_to_view = int(st.session_state.get("svc_pv_page_input", default_content_p)) + offset
-            st.session_state["svc_render_phys"] = int(page_to_view)
-        page_to_view = int(page_to_view)
+            page_to_view = int(st.session_state.get("svc_pv_page", default_content_p)) + offset
 
-        is_confirmed = page_to_view in confirmed_pages
+        is_confirmed = page_to_view in (confirmed_pages or [])
         is_front = page_to_view < start_page
         if is_front:
             front_label = next((lbl for p, lbl in front_pages if p == page_to_view), "앞부분")
-            caption = f"{front_label} (물리 p.{page_to_view})"
+            caption = f"{front_label} (물리적 p.{page_to_view})"
         else:
             caption = f"p.{page_to_view - offset}"
 
-        # 렌더
         try:
             if show_hl and is_confirmed and highlight_queries:
-                img, hits = render_pdf_page_png_with_highlights(pdf_path, page_to_view, highlight_queries, zoom=2.0)
+                img, hits = render_pdf_page_png_with_highlights(pdf_path, int(page_to_view), highlight_queries, zoom=2.0)
                 st.image(img, caption=f"{caption} (highlights={hits})", use_container_width=True)
             else:
-                img = render_pdf_page_png(pdf_path, page_to_view, zoom=2.0)
+                img = render_pdf_page_png(pdf_path, int(page_to_view), zoom=2.0)
                 st.image(img, caption=caption, use_container_width=True)
         except Exception as e:
             st.error("페이지 렌더링 실패")
             st.exception(e)
 
-        # 후보 페이지 리스트(이미지 아래) + 클릭 이동
-        if candidate_pages:
-            cand_content = [max(1, p - offset) for p in candidate_pages if p >= start_page]
-            st.markdown("**🟡 후보 페이지(클릭해서 이동)**")
-
-            # 버튼들을 한 줄에 너무 많이 놓지 않도록 6개씩 row
-            row = []
-            for idx, cp in enumerate(cand_content[: int(cfg_service["candidate_max"])]):
-                row.append(cp)
-                if len(row) == 6 or idx == len(cand_content[: int(cfg_service["candidate_max"])]) - 1:
-                    cols = st.columns(len(row))
-                    for c, page_num in zip(cols, row):
-                        if c.button(f"{page_num}", key=f"cand_{doc_id}_{page_num}_{idx}"):
-                            phys = int(page_num) + offset
-                            sync_auto_navigate(phys, start_page, n_pages)
-                            st.rerun()
-                    row = []
-        else:
-            st.caption("후보 페이지 없음")
-
     with col_chat:
         st.subheader("💬 채팅")
+
         for m in st.session_state.get("messages", []):
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
@@ -437,29 +362,27 @@ with tab_service:
                 with st.spinner("검색/답변 생성 중..."):
                     service_pp = str(cfg_service.get("pp_version", "pp_v5"))
 
-                    # 전처리 jsonl 없으면 자동 생성 (서비스 안정화: 실패 시 stop)
                     jsonl = paths.chunks_dir / service_pp / f"{doc_id}.jsonl"
                     if not jsonl.exists():
                         ok, msg = run_preprocessing(service_pp, doc_id, int(cfg_service["chunk_length"]), paths)
                         if not ok:
-                            st.error("전처리 생성 실패 → 서비스 실행을 중단합니다.")
-                            st.write(msg)
-                            st.stop()
+                            st.warning("전처리 생성 실패 → pdf_fallback으로 진행")
+                            jsonl = None
 
-                    # precomputed only
+                    source = "precomputed_chunks" if jsonl and jsonl.exists() else "pdf_fallback"
                     chunks, artifact_path = get_chunks(
                         doc_id=doc_id,
                         pdf_path=pdf_path,
                         paths=paths,
-                        source="precomputed_chunks",
-                        precomputed_jsonl=jsonl,
+                        source=source,
+                        precomputed_jsonl=(jsonl if source == "precomputed_chunks" else None),
                     )
 
                     retriever = build_or_load_hybrid(
                         chunks=chunks,
                         index_dir=paths.index_dir,
                         doc_id=doc_id,
-                        source=f"precomputed__{service_pp}",
+                        source=f"{source}__{service_pp}",
                         artifact_path=artifact_path,
                     )
 
@@ -467,22 +390,20 @@ with tab_service:
                     ev = evidence_text(results, max_chars=int(cfg_service["max_context_chars"]))
                     prov_pages = provisional_pages_from_results(results, max_pages=3)
 
-                    raw_answer = summarize_with_evidence(
+                    answer = summarize_with_evidence(
                         api_key=api_key,
                         model="gpt-5-mini",
                         query=user_msg,
                         evidence=ev,
-                        pages=prov_pages,  # 페이지 환각 방지
+                        pages=prov_pages,
                         temperature=float(cfg_service["temperature"]),
                         max_completion_tokens=int(cfg_service["max_completion_tokens"]),
                     )
-
-                    answer = clean_answer_remove_page_lines(raw_answer)
                     st.markdown(answer)
 
                     top_chunk_text = results[0].chunk.text if results else ""
-                    strong_q = extract_strong_queries(user_msg, raw_answer, top_chunk_text)  # raw_answer 사용(따옴표/숫자 확보)
-                    weak_q = [kw for kw in WEAK_KEYWORDS if kw in (user_msg + " " + raw_answer)]
+                    strong_q = extract_strong_queries(user_msg, answer, top_chunk_text)
+                    weak_q = [kw for kw in WEAK_KEYWORDS if kw in (user_msg + " " + answer)]
 
                     confirmed, candidates = pick_pages_confirmed_candidate(
                         pdf_path,
@@ -497,22 +418,7 @@ with tab_service:
                     st.session_state["svc_candidate_pages"] = candidates
                     st.session_state["svc_highlight_queries"] = strong_q if confirmed else []
 
-                    # ✅ 자동 이동: 확정 근거 페이지로 이동 (없으면 후보, 없으면 prov)
-                    target = None
-                    if confirmed:
-                        target = confirmed[0]
-                    elif candidates:
-                        target = candidates[0]
-                    elif prov_pages:
-                        target = prov_pages[0]
-
-                    if target is not None:
-                        sync_auto_navigate(int(target), get_start_page(doc_id), n_pages)
-
                     st.session_state["messages"].append({"role": "assistant", "content": answer})
-
-                    # 오른쪽 패널 즉시 갱신
-                    st.rerun()
 
 
 # =========================================================
