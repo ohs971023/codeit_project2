@@ -2,11 +2,12 @@
 # Do not edit manually unless you know what you're doing.
 
 CONFIG = {
+    "pp_version": "pp_v5",
     "chunk_length": 1200,
-    "top_k": 3,
+    "top_k": 5,
     "max_tokens": 2000,
     "max_completion_tokens": 2496,
     "temperature": 0.1,
     "alpha": 0.7,
-    "max_context_chars": 2500
+    "max_context_chars": 4100
 }

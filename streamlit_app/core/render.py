@@ -78,20 +78,23 @@ def find_pages_for_queries(
     pdf_path: str,
     queries: List[str],
     *,
+    start_page: int = 1,
     max_pages_scan: int = 200,
 ) -> List[int]:
     """
     PDF를 스캔해서 queries 중 하나라도 hit가 있는 페이지 목록(1-indexed)을 반환.
+    start_page: 스캔 시작 물리적 페이지(1-indexed). 목차 등 앞 페이지를 제외할 때 사용.
     """
     if not queries:
         return []
 
     doc = fitz.open(pdf_path)
     n = doc.page_count
-    limit = min(n, max_pages_scan)
+    p0_start = max(0, start_page - 1)
+    limit = min(n, p0_start + max_pages_scan)
 
     pages: List[int] = []
-    for p0 in range(limit):
+    for p0 in range(p0_start, limit):
         page = doc.load_page(p0)
         hit_any = False
         for q in queries:
@@ -115,12 +118,14 @@ def find_pages_with_hit_counts(
     pdf_path: str,
     queries: List[str],
     *,
+    start_page: int = 1,
     max_pages_scan: int = 200,
     max_hits_per_query: int = 100,
 ) -> Dict[int, int]:
     """
     PDF를 스캔해서 queries hit 개수를 페이지별로 합산해 반환.
     반환: {page_1indexed: total_hits}
+    - start_page: 스캔 시작 물리적 페이지(1-indexed). 목차 등 앞 페이지를 제외할 때 사용.
     - 여러 query의 hit를 합산
     - hit가 0인 페이지는 포함하지 않음
     """
@@ -129,10 +134,11 @@ def find_pages_with_hit_counts(
 
     doc = fitz.open(pdf_path)
     n = doc.page_count
-    limit = min(n, max_pages_scan)
+    p0_start = max(0, start_page - 1)
+    limit = min(n, p0_start + max_pages_scan)
 
     hit_map: Dict[int, int] = {}
-    for p0 in range(limit):
+    for p0 in range(p0_start, limit):
         page = doc.load_page(p0)
         total = 0
         for q in queries:
