@@ -192,11 +192,12 @@ def run_ragas_gpt5(
         ctx_list = r.get("retrieved_contexts", []) or []
         ctx_joined = "\n\n".join([str(x) for x in ctx_list])[:max_context_chars_per_sample]
 
-        prompt = JUDGE_PROMPT.format(
-            user_input=user_input,
-            response=response,
-            reference=ref_s,
-            retrieved_contexts=ctx_joined,
+        prompt = (
+            JUDGE_PROMPT
+            .replace("{user_input}", user_input)
+            .replace("{response}", response)
+            .replace("{reference}", ref_s)
+            .replace("{retrieved_contexts}", ctx_joined)
         )
 
         faith = None
