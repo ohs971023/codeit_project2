@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import gc
 import json
+import re  # ✅ [추가] 반복문자 제거용
 import unicodedata
 
 import numpy as np
@@ -37,13 +38,25 @@ extract_text = pp.extract_text
 
 chunk_from_alldata = getattr(pp, "chunk_from_alldata", None)
 
+# =========================================================
+# PDF 겹침으로 생기는 반복문자(4회 이상) 축약
+#   예: '2222222' -> '2', 'ㅋㅋㅋㅋ' -> 'ㅋ', '----' -> '-'
+# =========================================================
+_REPEAT_CHAR_4PLUS = re.compile(r"(.)\1{3,}")  # same char repeated >= 4
+
+def squash_repeated_chars(text: str) -> str:
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFC", str(text))
+    return _REPEAT_CHAR_4PLUS.sub(r"\1", t)
+
 
 # -------------------------
 # Config / Prompt
 # -------------------------
 CONFIG = {
     "chunk_length": 1200,          # C1 baseline
-    "top_k": 20,
+    "top_k": 3,
     "max_tokens": 2000,            # non gpt-5 (현재 코드에서는 미사용)
     "max_completion_tokens": 2000, # gpt-5
     "temperature": 0.1,            # non gpt-5 (현재 코드에서는 미사용)
@@ -145,7 +158,7 @@ class BaseGenerator(ABC):
     @abstractmethod
     def generate(self, queries: List[Tuple[str, str]], context: str) -> Dict[str, str]:
         ...
-        
+
 
 # -------------------------
 # Chunkers
@@ -156,6 +169,7 @@ class C1FixedChunker(BaseChunker):
 
     def chunk(self, doc_path: Path) -> List[str]:
         text = clean_text(extract_text(doc_path))
+        text = squash_repeated_chars(text)  # ✅ [추가]
         s = self.size
         return [text[i:i+s] for i in range(0, len(text), s)]
 
@@ -166,6 +180,7 @@ class C2PageChunker(BaseChunker):
         with pdfplumber.open(doc_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 page_text = clean_text(page.extract_text() or "")
+                page_text = squash_repeated_chars(page_text)  # ✅ [추가]
                 if page_text:
                     chunks.append(f"[페이지 {i+1}]\n{page_text}")
         return chunks
@@ -176,9 +191,11 @@ class C3SectionChunker(BaseChunker):
         if callable(chunk_from_alldata):
             chunks = chunk_from_alldata(doc_path.name, size=CONFIG["chunk_length"])
             if chunks is not None:
-                return chunks
+                # ✅ [추가] alldata에서 온 chunk도 반복문자 축약
+                return [squash_repeated_chars(c) for c in chunks]
 
         text = clean_text(extract_text(doc_path))
+        text = squash_repeated_chars(text)  # ✅ [추가]
         s = CONFIG["chunk_length"]
         return [text[i:i+s] for i in range(0, len(text), s)]
 
@@ -188,7 +205,8 @@ class C4DoclingChunker(BaseChunker):
         if callable(chunk_from_alldata):
             chunks = chunk_from_alldata(doc_path.name, size=CONFIG["chunk_length"])
             if chunks is not None:
-                return chunks
+                # ✅ [추가] alldata에서 온 chunk도 반복문자 축약
+                return [squash_repeated_chars(c) for c in chunks]
         return C1FixedChunker(size=CONFIG["chunk_length"]).chunk(doc_path)
 
 
