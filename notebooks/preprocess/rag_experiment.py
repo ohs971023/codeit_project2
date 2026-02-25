@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import gc
 import json
-import re  # ✅ [추가] 반복문자 제거용
+import re
 import unicodedata
 
 import numpy as np
@@ -29,20 +29,18 @@ try:
 except ImportError:
     try:
         from preprocess import pp_v5 as pp
-    except ImportError:  # v5/v6 미배포 전 백업
+    except ImportError:
         from preprocess import pp_v4 as pp
 
 ALL_DATA = getattr(pp, "ALL_DATA", None)
 clean_text = pp.clean_text
 extract_text = pp.extract_text
-
 chunk_from_alldata = getattr(pp, "chunk_from_alldata", None)
 
 # =========================================================
-# PDF 겹침으로 생기는 반복문자(4회 이상) 축약
-#   예: '2222222' -> '2', 'ㅋㅋㅋㅋ' -> 'ㅋ', '----' -> '-'
+# PDF 겹침으로 생기는 반복문자(4회 이상) 축약 → 1개로
 # =========================================================
-_REPEAT_CHAR_4PLUS = re.compile(r"(.)\1{3,}")  # same char repeated >= 4
+_REPEAT_CHAR_4PLUS = re.compile(r"(.)\1{3,}")
 
 def squash_repeated_chars(text: str) -> str:
     if not text:
@@ -50,18 +48,32 @@ def squash_repeated_chars(text: str) -> str:
     t = unicodedata.normalize("NFC", str(text))
     return _REPEAT_CHAR_4PLUS.sub(r"\1", t)
 
+def _dedupe_ints_keep_order(xs: List[int]) -> List[int]:
+    seen = set()
+    out = []
+    for x in xs or []:
+        try:
+            xi = int(x)
+        except Exception:
+            continue
+        if xi in seen:
+            continue
+        seen.add(xi)
+        out.append(xi)
+    return out
+
 
 # -------------------------
 # Config / Prompt
 # -------------------------
 CONFIG = {
-    "chunk_length": 1200,          # C1 baseline
-    "top_k": 3,
-    "max_tokens": 2000,            # non gpt-5 (현재 코드에서는 미사용)
-    "max_completion_tokens": 2000, # gpt-5
-    "temperature": 0.1,            # non gpt-5 (현재 코드에서는 미사용)
-    "alpha": 0.7,                  # hybrid weight for vector score
-    "max_context_chars": 6000,     # context hard cap (chars)
+    "chunk_length": 1200,
+    "top_k": 20,                  # (구버전) 기본 검색 K
+    "max_tokens": 2000,
+    "max_completion_tokens": 2000,
+    "temperature": 0.1,
+    "alpha": 0.7,
+    "max_context_chars": 6000,
 }
 
 RFP_PROMPT = """역할: 너는 RFP/입찰 공고 문서(CONTEXT 발췌)에서 정보를 추출한다.
@@ -169,7 +181,7 @@ class C1FixedChunker(BaseChunker):
 
     def chunk(self, doc_path: Path) -> List[str]:
         text = clean_text(extract_text(doc_path))
-        text = squash_repeated_chars(text)  # ✅ [추가]
+        text = squash_repeated_chars(text)
         s = self.size
         return [text[i:i+s] for i in range(0, len(text), s)]
 
@@ -180,7 +192,7 @@ class C2PageChunker(BaseChunker):
         with pdfplumber.open(doc_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 page_text = clean_text(page.extract_text() or "")
-                page_text = squash_repeated_chars(page_text)  # ✅ [추가]
+                page_text = squash_repeated_chars(page_text)
                 if page_text:
                     chunks.append(f"[페이지 {i+1}]\n{page_text}")
         return chunks
@@ -191,11 +203,10 @@ class C3SectionChunker(BaseChunker):
         if callable(chunk_from_alldata):
             chunks = chunk_from_alldata(doc_path.name, size=CONFIG["chunk_length"])
             if chunks is not None:
-                # ✅ [추가] alldata에서 온 chunk도 반복문자 축약
                 return [squash_repeated_chars(c) for c in chunks]
 
         text = clean_text(extract_text(doc_path))
-        text = squash_repeated_chars(text)  # ✅ [추가]
+        text = squash_repeated_chars(text)
         s = CONFIG["chunk_length"]
         return [text[i:i+s] for i in range(0, len(text), s)]
 
@@ -205,7 +216,6 @@ class C4DoclingChunker(BaseChunker):
         if callable(chunk_from_alldata):
             chunks = chunk_from_alldata(doc_path.name, size=CONFIG["chunk_length"])
             if chunks is not None:
-                # ✅ [추가] alldata에서 온 chunk도 반복문자 축약
                 return [squash_repeated_chars(c) for c in chunks]
         return C1FixedChunker(size=CONFIG["chunk_length"]).chunk(doc_path)
 
@@ -272,7 +282,6 @@ class R3HybridRetriever(BaseRetriever):
         vec_idxs = vec_I[0].astype(int)
 
         union = np.unique(np.concatenate([cand_idxs, vec_idxs]))
-
         bm = bm25_scores[union]
 
         vec_rank_score = np.zeros(len(chunks), dtype=np.float32)
@@ -362,11 +371,9 @@ class OpenAIGenerator(BaseGenerator):
                 if k not in obj:
                     out[k] = NOT_FOUND
                     continue
-
                 v_raw = obj.get(k)
                 v = (v_raw or "").strip()
                 out[k] = v if v else GEN_FAIL
-
             return out
 
         except Exception as e:
@@ -429,10 +436,23 @@ class RAGExperiment:
         doc_path: Path,
         gold_fields_df: pd.DataFrame,
         gold_evidence_df: pd.DataFrame,
-        top_k: int = 20,
+        *,
+        context_k: Optional[int] = None,
+        recall_k: Optional[int] = None,
+        top_k: int = 20,  # (구버전 호환)
         sim_threshold: int = 80,
     ) -> Dict[str, Any]:
+        """
+        ✅ 질문별 retrieve
+        - context_k: LLM context에 사용할 K
+        - recall_k : ret_recall/mrr 계산용 K
+        """
         doc_name = unicodedata.normalize("NFC", doc_path.name)
+
+        ctx_k = int(context_k) if context_k is not None else int(top_k)
+        ret_k = int(recall_k) if recall_k is not None else int(top_k)
+        if ret_k < ctx_k:
+            ret_k = ctx_k
 
         queries = get_queries_for_doc(doc_name, self.questions_df)
         chunks = self.chunker.chunk(doc_path)
@@ -446,7 +466,8 @@ class RAGExperiment:
         r_list: List[Dict[str, float]] = []
 
         for field, question in queries:
-            idxs = self.retriever.retrieve(index, [question], top_k=top_k)
+            idxs = self.retriever.retrieve(index, [question], top_k=ctx_k)
+            idxs = _dedupe_ints_keep_order(idxs)
             context = "".join(chunks[int(i)] for i in idxs if 0 <= int(i) < len(chunks))
 
             one_pred = self.generator.generate([(field, question)], context)
@@ -457,16 +478,20 @@ class RAGExperiment:
             gold = gold_row["gold"].iloc[0] if not gold_row.empty else None
             g_list.append(eval_gen(pred, gold, threshold=sim_threshold))
 
+            eval_idxs = idxs[:ret_k]
             for _, row in qdf[qdf["field"].astype(str) == str(field)].iterrows():
                 iid = str(row["instance_id"])
                 anchors = GOLD_ANCHOR.get(iid, [])
                 if anchors:
-                    r_list.append(eval_retrieval_by_anchor(chunks, idxs, anchors))
+                    r_list.append(eval_retrieval_by_anchor(chunks, eval_idxs, anchors))
                 else:
                     r_list.append({"recall": np.nan, "mrr": np.nan})
 
         metrics: Dict[str, Any] = {
             "doc_id": doc_name,
+            "context_k": int(ctx_k),
+            "recall_k": int(ret_k),
+
             "n_questions": int(len(qdf)),
             "chunk_count": int(len(chunks)),
             "pred_map": pred_map,
@@ -488,11 +513,24 @@ class RAGExperiment:
         doc_path: Path,
         gold_fields_df: pd.DataFrame,
         gold_evidence_df: pd.DataFrame,
-        top_k: int = 20,
+        *,
+        context_k: Optional[int] = None,
+        recall_k: Optional[int] = None,
+        top_k: int = 20,  # (구버전 호환)
         sim_threshold: int = 80,
         warn_on_mismatch: bool = True,
     ) -> Dict[str, Any]:
+        """
+        ✅ 문서 단위: 전체 질문을 한 번에 보고 context 생성
+        - context_k: LLM context에 사용할 K
+        - recall_k : ret_recall/mrr 계산용 K
+        """
         doc_name = unicodedata.normalize("NFC", doc_path.name)
+
+        ctx_k = int(context_k) if context_k is not None else int(top_k)
+        ret_k = int(recall_k) if recall_k is not None else int(top_k)
+        if ret_k < ctx_k:
+            ret_k = ctx_k
 
         queries = get_queries_for_doc(doc_name, self.questions_df)
         q_texts = [q for _t, q in queries]
@@ -500,7 +538,9 @@ class RAGExperiment:
 
         chunks = self.chunker.chunk(doc_path)
         index = self.retriever.build_index(chunks)
-        idxs = self.retriever.retrieve(index, q_texts, top_k=top_k)
+
+        idxs = self.retriever.retrieve(index, q_texts, top_k=ctx_k)
+        idxs = _dedupe_ints_keep_order(idxs)
 
         context = "".join(chunks[int(i)] for i in idxs if 0 <= int(i) < len(chunks))
         pred_map = self.generator.generate(queries, context)
@@ -544,17 +584,21 @@ class RAGExperiment:
         n_nonempty_preds = int(sum(1 for p in preds if str(p).strip()))
         n_notfound_preds = int(sum(1 for p in preds if str(p).strip().lower() in {"notfound", "not_found", "없음"}))
 
+        eval_idxs = idxs[:ret_k]
         r_list: List[Dict[str, float]] = []
         for _, row in qdf.iterrows():
             iid = str(row["instance_id"])
             anchors = GOLD_ANCHOR.get(iid, [])
             if anchors:
-                r_list.append(eval_retrieval_by_anchor(chunks, idxs, anchors))
+                r_list.append(eval_retrieval_by_anchor(chunks, eval_idxs, anchors))
             else:
                 r_list.append({"recall": np.nan, "mrr": np.nan})
 
         metrics: Dict[str, Any] = {
             "doc_id": doc_name,
+            "context_k": int(ctx_k),
+            "recall_k": int(ret_k),
+
             "expected_answer_count": int(expected_answer_count),
             "answer_count": int(answer_count),
 
@@ -573,6 +617,7 @@ class RAGExperiment:
 
             "pred_map": pred_map,
 
+            # ✅ ret_* 는 recall_k 기준으로 계산된 값
             "ret_recall": float(np.nanmean([x["recall"] for x in r_list])),
             "ret_mrr": float(np.nanmean([x["mrr"] for x in r_list])),
 

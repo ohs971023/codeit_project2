@@ -6,9 +6,8 @@ import json
 import re
 import time
 import importlib
-import inspect
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -47,10 +46,14 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 FIXED_CONFIG_PY = paths.repo_root / "streamlit_app" / "core" / "fixed_config.py"
 
+# ✅ 서비스/평가 값 섞이지 않게: 서비스 설정은 service_* prefix로 저장
 DEFAULT_CFG = {
-    "pp_version": "pp_v5",
-    "chunk_length": 1200,
-    "top_k": 8,
+    # ---- 서비스용 ----
+    "service_chunk_mode": "precomputed",  # "precomputed" | "runtime_c1"
+    "pp_version": "pp_v5",                # precomputed일 때만 의미
+    "chunk_length": 1200,                 # runtime_c1 chunk length / 전처리 size
+    "service_context_k": 8,               # LLM 입력 K
+    "service_recall_k": 20,               # 검색 K (>= context_k 권장)
     "alpha": 0.7,
     "max_context_chars": 2500,
     "max_completion_tokens": 800,
@@ -58,6 +61,9 @@ DEFAULT_CFG = {
     "confirmed_max": 2,
     "candidate_max": 12,
     "max_pages_scan": 200,
+
+    # ---- (구버전 호환) ----
+    "top_k": 8,
 }
 
 WEAK_KEYWORDS = ["예산", "사업비", "소요예산", "부가가치세", "VAT", "계약", "입찰", "기간", "마감", "제출", "기관", "요구사항"]
@@ -306,7 +312,7 @@ def sync_auto_navigate(target_phys: int, start_page: int, n_pages: int):
 
 
 # =========================================================
-# Eval helpers: 표준화 + merge + 평균
+# Eval helpers
 # =========================================================
 def _to_float_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
@@ -368,13 +374,9 @@ def make_mean_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# Monkeypatch: pp_v6 page=None 오류 런타임 해결 (파일 수정 X)
+# Monkeypatch: pp_v6 page=None 오류 런타임 해결
 # =========================================================
 def monkeypatch_pp_v6_table_title_guard():
-    """
-    preprocess.pp_v6._find_table_title 내부에서 page가 None일 때 int-NoneType 오류 방지.
-    pp_v6가 존재할 때만 런타임 패치한다.
-    """
     try:
         ppv6 = cached_import("preprocess.pp_v6")
     except Exception:
@@ -398,7 +400,6 @@ def monkeypatch_pp_v6_table_title_guard():
             t = (text or "").strip()
             return bool(t) and (("표" in t) or ("별표" in t) or ("총괄표" in t) or ("목록표" in t))
 
-        # backward scan
         for i in range(anchor_idx - 1, max(-1, anchor_idx - 40), -1):
             meta = items[i].get("metadata", {}) or {}
             mp = _safe_int(meta.get("page", -999), default=-999)
@@ -410,7 +411,6 @@ def monkeypatch_pp_v6_table_title_guard():
             if _is_table_like_caption(cand):
                 return cand
 
-        # forward scan
         for i in range(anchor_idx + 1, min(len(items), anchor_idx + 15)):
             meta = items[i].get("metadata", {}) or {}
             mp = _safe_int(meta.get("page", -999), default=-999)
@@ -580,35 +580,63 @@ with tab_service:
 
             with st.chat_message("assistant"):
                 with st.spinner("검색/답변 생성 중..."):
+                    service_chunk_mode = str(cfg_service.get("service_chunk_mode", "precomputed"))
                     service_pp = str(cfg_service.get("pp_version", "pp_v5"))
 
-                    jsonl = paths.chunks_dir / service_pp / f"{doc_id}.jsonl"
-                    if not jsonl.exists():
-                        ok, msg = run_preprocessing(service_pp, doc_id, int(cfg_service["chunk_length"]), paths)
-                        if not ok:
-                            st.error("전처리 생성 실패 → 서비스 실행을 중단합니다.")
-                            st.write(msg)
-                            st.stop()
+                    svc_ctx_k = int(cfg_service.get("service_context_k", cfg_service.get("top_k", 8)))
+                    svc_ret_k = int(cfg_service.get("service_recall_k", max(svc_ctx_k, int(cfg_service.get("top_k", 8)))))
 
-                    chunks, artifact_path = get_chunks(
-                        doc_id=doc_id,
-                        pdf_path=pdf_path,
-                        paths=paths,
-                        source="precomputed_chunks",
-                        precomputed_jsonl=jsonl,
-                    )
+                    if svc_ret_k < svc_ctx_k:
+                        svc_ret_k = svc_ctx_k
+
+                    chunk_len = int(cfg_service.get("chunk_length", 1200))
+
+                    # -------- chunks 로드 --------
+                    if service_chunk_mode == "precomputed":
+                        jsonl = paths.chunks_dir / service_pp / f"{doc_id}.jsonl"
+                        if not jsonl.exists():
+                            ok, msg = run_preprocessing(service_pp, doc_id, int(chunk_len), paths)
+                            if not ok:
+                                st.error("전처리 생성 실패 → 서비스 실행을 중단합니다.")
+                                st.write(msg)
+                                st.stop()
+
+                        chunks, artifact_path = get_chunks(
+                            doc_id=doc_id,
+                            pdf_path=pdf_path,
+                            paths=paths,
+                            source="precomputed_chunks",
+                            precomputed_jsonl=jsonl,
+                        )
+                        source_key = f"precomputed__{service_pp}"
+
+                    elif service_chunk_mode == "runtime_c1":
+                        chunks, artifact_path = get_chunks(
+                            doc_id=doc_id,
+                            pdf_path=pdf_path,
+                            paths=paths,
+                            source="runtime_c1",
+                            chunk_length=int(chunk_len),
+                        )
+                        source_key = f"runtime_c1__len{chunk_len}"
+
+                    else:
+                        st.error(f"Unknown service_chunk_mode: {service_chunk_mode}")
+                        st.stop()
 
                     retriever = build_or_load_hybrid(
                         chunks=chunks,
                         index_dir=paths.index_dir,
                         doc_id=doc_id,
-                        source=f"precomputed__{service_pp}",
+                        source=source_key,
                         artifact_path=artifact_path,
                     )
 
-                    results = retriever.search(user_msg, k=int(cfg_service["top_k"]), alpha=float(cfg_service["alpha"]))
-                    ev = evidence_text(results, max_chars=int(cfg_service["max_context_chars"]))
-                    prov_pages = provisional_pages_from_results(results, max_pages=3)
+                    results_all = retriever.search(user_msg, k=int(svc_ret_k), alpha=float(cfg_service["alpha"]))
+                    results_llm = (results_all or [])[: int(svc_ctx_k)]
+
+                    ev = evidence_text(results_llm, max_chars=int(cfg_service["max_context_chars"]))
+                    prov_pages = provisional_pages_from_results(results_llm, max_pages=3)
 
                     raw_answer = summarize_with_evidence(
                         api_key=api_key,
@@ -623,7 +651,7 @@ with tab_service:
                     answer = clean_answer_remove_page_lines(raw_answer)
                     st.markdown(answer)
 
-                    top_chunk_text = results[0].chunk.text if results else ""
+                    top_chunk_text = results_llm[0].chunk.text if results_llm else ""
                     strong_q = extract_strong_queries(user_msg, raw_answer, top_chunk_text)
                     weak_q = [kw for kw in WEAK_KEYWORDS if kw in (user_msg + " " + raw_answer)]
 
@@ -661,34 +689,68 @@ with tab_service:
 # =========================================================
 with tab_exp_eval:
     st.subheader("🧪 실험/평가 설정")
-    st.caption("여기서 저장한 값이 서비스에 자동 반영되며, fixed_config.py도 자동으로 덮어씁니다.")
+    st.caption("상단(서비스 설정)은 저장 시 서비스에 반영되고, 하단(평가)은 평가에만 적용됩니다.")
 
     cfg_now = load_cfg()
 
+    # -------------------------
+    # ✅ 서비스 설정(저장 시 서비스에 반영)
+    # -------------------------
+    st.markdown("### ✅ 서비스 설정(저장 시 서비스에 반영)")
     colA, colB = st.columns(2)
+
     with colA:
+        service_chunk_mode = st.selectbox(
+            "서비스 chunk mode",
+            ["precomputed", "runtime_c1"],
+            index=0 if str(cfg_now.get("service_chunk_mode", "precomputed")) == "precomputed" else 1,
+        )
         pp_version = st.selectbox(
-            "pp version(서비스에도 적용)",
+            "pp version (precomputed일 때 사용)",
             pp_versions,
             index=pp_versions.index(cfg_now["pp_version"]) if cfg_now["pp_version"] in pp_versions else 0
         )
-        chunk_length = st.slider("chunk_length", 300, 2000, int(cfg_now["chunk_length"]), 100)
-        top_k = st.slider("top_k", 2, 30, int(cfg_now["top_k"]), 1)
-        alpha = st.slider("alpha(hybrid)", 0.0, 1.0, float(cfg_now["alpha"]), 0.05)
-        max_context_chars = st.slider("max_context_chars", 500, 8000, int(cfg_now["max_context_chars"]), 100)
+        chunk_length = st.slider("chunk_length (서비스 runtime_c1 & 전처리 size)", 300, 4000, int(cfg_now["chunk_length"]), 100)
+
+        service_context_k = st.slider(
+            "service context_K (LLM 입력 K)",
+            2, 40,
+            int(cfg_now.get("service_context_k", cfg_now.get("top_k", 8))),
+            1
+        )
+        service_recall_k = st.slider(
+            "service recall_K (검색 K, context_K 이상 권장)",
+            2, 80,
+            int(cfg_now.get("service_recall_k", max(service_context_k, int(cfg_now.get("top_k", 8))))),
+            1
+        )
 
     with colB:
+        alpha = st.slider("alpha(hybrid)", 0.0, 1.0, float(cfg_now["alpha"]), 0.05)
+        max_context_chars = st.slider("max_context_chars", 500, 12000, int(cfg_now["max_context_chars"]), 100)
         max_completion_tokens = st.slider("max_completion_tokens", 128, 4096, int(cfg_now["max_completion_tokens"]), 64)
         temperature = st.slider("temperature", 0.0, 1.5, float(cfg_now["temperature"]), 0.05)
         confirmed_max = st.slider("confirmed_max", 1, 4, int(cfg_now["confirmed_max"]), 1)
         candidate_max = st.slider("candidate_max", 5, 30, int(cfg_now["candidate_max"]), 1)
         max_pages_scan = st.slider("max_pages_scan", 10, 400, int(cfg_now["max_pages_scan"]), 10)
 
+    if service_recall_k < service_context_k:
+        st.warning("service recall_K가 context_K보다 작습니다. 저장 시 recall_K를 context_K로 올려서 저장합니다.")
+
     if st.button("✅ 저장 → 서비스 반영 + fixed_config.py 덮어쓰기"):
+        svc_ctx = int(service_context_k)
+        svc_ret = int(service_recall_k)
+        if svc_ret < svc_ctx:
+            svc_ret = svc_ctx
+
         cfg_new = {
+            "service_chunk_mode": str(service_chunk_mode),
             "pp_version": str(pp_version),
             "chunk_length": int(chunk_length),
-            "top_k": int(top_k),
+
+            "service_context_k": int(svc_ctx),
+            "service_recall_k": int(svc_ret),
+
             "alpha": float(alpha),
             "max_context_chars": int(max_context_chars),
             "max_completion_tokens": int(max_completion_tokens),
@@ -696,30 +758,54 @@ with tab_exp_eval:
             "confirmed_max": int(confirmed_max),
             "candidate_max": int(candidate_max),
             "max_pages_scan": int(max_pages_scan),
+
+            # 구버전 호환: top_k도 남김
+            "top_k": int(svc_ctx),
         }
         save_cfg(cfg_new)
 
         fixed_out = {
+            "service_chunk_mode": str(service_chunk_mode),
             "pp_version": str(pp_version),
             "chunk_length": int(chunk_length),
-            "top_k": int(top_k),
+
+            "service_context_k": int(svc_ctx),
+            "service_recall_k": int(svc_ret),
+
+            "alpha": float(alpha),
             "max_tokens": 2000,
             "max_completion_tokens": int(max_completion_tokens),
             "temperature": float(temperature),
-            "alpha": float(alpha),
             "max_context_chars": int(max_context_chars),
+
+            # 구버전 호환
+            "top_k": int(svc_ctx),
         }
         write_fixed_config_py(FIXED_CONFIG_PY, fixed_out)
         st.success("저장 완료! 서비스 반영 + fixed_config.py 업데이트 완료")
 
+    # -------------------------
+    # 평가(평가 전용)
+    # -------------------------
     st.divider()
-    st.subheader("📊 평가 실행 (rag_experiment.py / ragas_eval.py 기반)")
-    st.caption("옵션 A: questions.csv에 포함된 doc_id만 평가합니다(파일 존재하는 것만).")
+    st.subheader("📊 평가 실행 (평가 전용 설정)")
+    st.caption("아래 설정은 저장되지 않으며, 평가 실행 시에만 적용됩니다(서비스 영향 없음).")
 
     eval_chunker = st.selectbox("chunker", ["C1", "C2", "C3", "C4"], index=0, key="eval_chunker")
     eval_retriever = st.selectbox("retriever", ["R1", "R2", "R3"], index=2, key="eval_retriever")
     eval_generator = st.selectbox("generator", ["G1", "G2"], index=0, key="eval_generator")
-    eval_top_k = st.slider("eval top_k", 2, 30, int(top_k), 1, key="eval_topk")
+
+    eval_context_k = st.slider("eval context_K (LLM 입력 K)", 2, 40, 8, 1, key="eval_context_k")
+    eval_recall_k = st.slider("eval recall_K (ret_recall@K 기준)", 2, 80, 20, 1, key="eval_recall_k")
+    if eval_recall_k < eval_context_k:
+        st.warning("eval recall_K가 context_K보다 작습니다. 실행 시 recall_K를 context_K로 맞춥니다.")
+
+    # ✅ 평가 전용 슬라이더(서비스값과 완전 분리)
+    eval_chunk_length = st.slider("eval chunk_length", 300, 4000, 1200, 100, key="eval_chunk_length")
+    eval_max_context_chars = st.slider("eval max_context_chars", 500, 12000, 6000, 100, key="eval_max_context_chars")
+    eval_max_completion_tokens = st.slider("eval max_completion_tokens", 128, 4096, 2000, 64, key="eval_max_completion_tokens")
+    eval_alpha = st.slider("eval alpha(hybrid)", 0.0, 1.0, 0.7, 0.05, key="eval_alpha")
+
     eval_sim_threshold = st.slider("eval sim_threshold", 50, 100, 80, 1, key="eval_sim")
     run_ragas = st.checkbox("RAGAS 실행", value=True, key="eval_ragas")
     judge_model = st.selectbox("RAGAS Judge", ["gpt-5-mini", "gpt-5-nano"], index=0, key="eval_judge")
@@ -733,33 +819,29 @@ with tab_exp_eval:
         with st.status("평가 실행 중...", expanded=True) as status:
             t0 = time.time()
             try:
-                # ✅ pp_v6 page=None 등 런타임 패치
                 monkeypatch_pp_v6_table_title_guard()
 
                 rag_experiment = cached_import("preprocess.rag_experiment")
                 ragas_eval = cached_import("preprocess.ragas_eval")
 
-                # (선택) rag_experiment CONFIG 반영 (기존 코드 유지)
-                if hasattr(rag_experiment, "CONFIG") and isinstance(rag_experiment.CONFIG, dict):
-                    rag_experiment.CONFIG["chunk_length"] = int(chunk_length)
+                # ✅ 평가 전용 CONFIG 주입
+                rag_experiment.CONFIG["chunk_length"] = int(eval_chunk_length)
+                rag_experiment.CONFIG["alpha"] = float(eval_alpha)
+                rag_experiment.CONFIG["max_context_chars"] = int(eval_max_context_chars)
+                rag_experiment.CONFIG["max_completion_tokens"] = int(eval_max_completion_tokens)
 
                 questions_df = rag_experiment.load_questions_df()
                 gold_evidence_df = pd.read_csv(paths.eval_dir / "gold_evidence.csv")
                 gold_fields_df = ragas_eval.load_gold_fields_jsonl(paths.eval_dir / "gold_fields.jsonl")
 
-                # ✅ 옵션 A: questions.csv에 포함된 doc_id만 평가
                 doc_names = sorted(set(
                     questions_df.loc[questions_df["doc_id"] != "*", "doc_id"].astype(str).tolist()
                 ))
-
                 missing = [name for name in doc_names if not (paths.pdf_dir / name).exists()]
                 run_docs = [paths.pdf_dir / name for name in doc_names if (paths.pdf_dir / name).exists()]
 
                 if not run_docs:
-                    raise RuntimeError(
-                        f"평가 문서가 없습니다. questions.csv doc_id 와 data/raw/files 매칭 확인\n"
-                        f"missing sample={missing[:8]}"
-                    )
+                    raise RuntimeError("평가 문서가 없습니다. questions.csv doc_id 와 data/raw/files 매칭 확인")
 
                 if missing:
                     st.warning(f"questions.csv에 있지만 PDF가 없는 문서가 {len(missing)}개 있습니다.")
@@ -780,6 +862,11 @@ with tab_exp_eval:
                 )
                 exp = rag_experiment.RAGExperiment(chunker_obj, retriever_obj, gen_obj, questions_df)
 
+                ctx_k = int(eval_context_k)
+                ret_k = int(eval_recall_k)
+                if ret_k < ctx_k:
+                    ret_k = ctx_k
+
                 rows: List[Dict[str, Any]] = []
                 failed: List[Dict[str, Any]] = []
 
@@ -789,16 +876,18 @@ with tab_exp_eval:
                             doc_path=Path(dp),
                             gold_fields_df=gold_fields_df,
                             gold_evidence_df=gold_evidence_df,
-                            top_k=int(eval_top_k),
+                            context_k=ctx_k,
+                            recall_k=ret_k,
                             sim_threshold=int(eval_sim_threshold),
                         )
-                        # 실험 스펙 태깅
                         m["chunker"] = spec.chunker
                         m["retriever"] = spec.retriever
                         m["generator"] = spec.generator
+                        m["context_k"] = int(ctx_k)
+                        m["recall_k"] = int(ret_k)
                         rows.append(m)
                     except Exception as e:
-                        failed.append({"doc_id": dp.name, "error": repr(e)})
+                        failed.append({"doc_id": Path(dp).name, "error": repr(e)})
 
                 if not rows:
                     raise RuntimeError(
@@ -824,8 +913,8 @@ with tab_exp_eval:
                         compute_baseline_doc_metrics=False,
                         gold_evidence_df=gold_evidence_df,
                         sim_threshold=int(eval_sim_threshold),
-                        # 아래 두 파라미터는 네 위 코드에 맞춰 옵션으로 둠(없으면 무시될 수 있음)
-                        judge_max_context_chars_per_sample=int(max_context_chars),
+                        context_k=int(ctx_k),
+                        judge_max_context_chars_per_sample=int(eval_max_context_chars),
                         judge_max_output_tokens=500,
                         judge_reasoning_effort="minimal",
                     )
@@ -841,6 +930,8 @@ with tab_exp_eval:
                 st.session_state["eval_merged_df"] = merged_df
                 st.session_state["eval_mean_df"] = mean_df
                 st.session_state["eval_failed_docs"] = pd.DataFrame(failed) if failed else pd.DataFrame()
+                st.session_state["eval_ctx_k"] = int(ctx_k)
+                st.session_state["eval_ret_k"] = int(ret_k)
 
                 status.update(label=f"평가 완료 ✅ ({time.time()-t0:.2f}s)", state="complete")
 
@@ -859,8 +950,14 @@ with tab_exp_eval:
 
     merged_df = st.session_state.get("eval_merged_df")
     if merged_df is not None:
+        ctx_k = st.session_state.get("eval_ctx_k", None)
+        ret_k = st.session_state.get("eval_ret_k", None)
+        if ctx_k is not None and ret_k is not None:
+            st.caption(f"현재 평가 설정: context_K={ctx_k}, recall_K={ret_k} (ret_recall/ret_mrr은 recall_K 기준)")
+
         preferred = [
             "doc_id",
+            "context_k", "recall_k",
             "ret_recall", "ret_mrr", "gen_fill", "gen_match", "gen_sim",
             "faithfulness", "context_precision", "answer_correctness",
             "chunker", "retriever", "generator",

@@ -78,6 +78,36 @@ def extract_page_texts_from_pdf(pdf_path: str) -> List[Tuple[int, str]]:
     return out
 
 
+def _page_texts_to_runtime_c1_chunks(doc_id: str, page_texts: List[Tuple[int, str]], chunk_length: int) -> List[Chunk]:
+    """
+    ✅ runtime C1:
+    - 페이지를 유지한 상태로 텍스트를 chunk_length 기준으로 잘라 Chunk 생성
+    - 서비스의 페이지 하이라이트/근거 보기 UX를 유지하기 위함
+    """
+    out: List[Chunk] = []
+    doc_id_n = _norm_doc_id(doc_id)
+    chunk_length = max(50, int(chunk_length or 1200))
+
+    for page, txt in page_texts:
+        t = post_clean_text(txt)
+        if not t:
+            continue
+        # 페이지 단위로 chunk_length 잘라서 chunk_id 생성
+        for ci, start in enumerate(range(0, len(t), chunk_length)):
+            piece = t[start:start + chunk_length]
+            if not piece.strip():
+                continue
+            chunk_id = f"{Path(doc_id_n).stem}__p{int(page):04d}_c{ci:04d}__rt{chunk_length}"
+            out.append(Chunk(
+                doc_id=doc_id_n,
+                page=int(page),
+                chunk_id=chunk_id,
+                text=piece,
+                section_path=None,
+            ))
+    return out
+
+
 def get_chunks(
     doc_id: str,
     pdf_path: Optional[str],
@@ -85,11 +115,13 @@ def get_chunks(
     source: str,
     *,
     precomputed_jsonl: Optional[Path] = None,
+    chunk_length: Optional[int] = None,  # ✅ runtime_c1에 사용
 ) -> Tuple[List[Chunk], Path]:
     """
     source:
-      - precomputed_chunks : precomputed_jsonl를 반드시 넘기는 걸 권장
-      - pdf_fallback
+      - precomputed_chunks : precomputed_jsonl 필요
+      - pdf_fallback       : 페이지 단위 chunk
+      - runtime_c1         : 페이지 유지 + chunk_length 기준 문자청킹
     Returns: (chunks, artifact_path)
     """
     doc_id_n = _norm_doc_id(doc_id)
@@ -110,6 +142,13 @@ def get_chunks(
             Chunk(doc_id=doc_id_n, page=p, chunk_id=f"{Path(doc_id_n).stem}__p{p:04d}_pagechunk", text=t)
             for p, t in page_texts
         ]
+        return chunks, Path(pdf_path)
+
+    if source == "runtime_c1":
+        if not pdf_path:
+            raise FileNotFoundError("pdf_path가 없어서 runtime_c1으로 로드할 수 없습니다.")
+        page_texts = extract_page_texts_from_pdf(pdf_path)
+        chunks = _page_texts_to_runtime_c1_chunks(doc_id_n, page_texts, int(chunk_length or 1200))
         return chunks, Path(pdf_path)
 
     raise ValueError(f"Unknown source: {source}")

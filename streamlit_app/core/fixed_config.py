@@ -2,12 +2,19 @@
 # Do not edit manually unless you know what you're doing.
 
 CONFIG = {
+    "service_chunk_mode": "precomputed",
     "pp_version": "pp_v5",
     "chunk_length": 1200,
-    "top_k": 20,
-    "max_tokens": 2000,
-    "max_completion_tokens": 2496,
-    "temperature": 0.1,
+
+    "service_context_k": 8,
+    "service_recall_k": 20,
+
     "alpha": 0.7,
-    "max_context_chars": 4100
+    "max_tokens": 2000,
+    "max_completion_tokens": 800,
+    "temperature": 0.1,
+    "max_context_chars": 2500,
+
+    # (구버전 호환)
+    "top_k": 8
 }

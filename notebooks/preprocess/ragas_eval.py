@@ -7,14 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
-# 같은 CONFIG/spec/component을 그대로 재사용
 from preprocess.rag_experiment import (
     CONFIG,
     ExperimentSpec,
@@ -27,24 +25,13 @@ from preprocess.rag_experiment import (
 # Gold loader (fields.jsonl -> long df)
 # ------------------------------------------------------------
 def load_gold_fields_jsonl(path: str | Path) -> pd.DataFrame:
-    """
-    gold_fields.jsonl 형태:
-      {"instance_id": "...", "doc_id": "...", "fields": {"fieldA": "goldA", ...}}
-    -> long df:
-      instance_id, doc_id, field, gold
-
-    ✅ BOM(utf-8-sig) 안전 대응
-    """
     path = Path(path)
     rows = []
-
-    # 핵심: utf-8-sig로 BOM 제거
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            # 혹시 라인 앞에 BOM이 남아있을 수 있어 재차 제거
             line = line.lstrip("\ufeff").strip()
             if not line:
                 continue
@@ -56,9 +43,7 @@ def load_gold_fields_jsonl(path: str | Path) -> pd.DataFrame:
         doc_id = r.get("doc_id", "")
         fields = r.get("fields", {}) or {}
         for k, v in fields.items():
-            out.append(
-                {"instance_id": iid, "doc_id": doc_id, "field": str(k), "gold": v}
-            )
+            out.append({"instance_id": iid, "doc_id": doc_id, "field": str(k), "gold": v})
     return pd.DataFrame(out)
 
 
@@ -76,8 +61,23 @@ def _gold_map_for_doc(gold_fields_df: pd.DataFrame, doc_name: str) -> Dict[str, 
     return m
 
 
+def _dedupe_ints_keep_order(xs: List[int]) -> List[int]:
+    seen = set()
+    out = []
+    for x in xs or []:
+        try:
+            xi = int(x)
+        except Exception:
+            continue
+        if xi in seen:
+            continue
+        seen.add(xi)
+        out.append(xi)
+    return out
+
+
 # ------------------------------------------------------------
-# Build RAGAS-style rows from the SAME run (same CONFIG)
+# Build RAGAS-style rows
 # ------------------------------------------------------------
 def build_ragas_rows_for_doc(
     doc_path: Path,
@@ -88,25 +88,21 @@ def build_ragas_rows_for_doc(
     generator,
     top_k: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Returns:
-      ragas_rows: [{user_input, response, retrieved_contexts, reference, doc_id, field}, ...]
-      doc_meta: debug meta per doc
-    """
     doc_name = unicodedata.normalize("NFC", doc_path.name)
     queries: List[Tuple[str, str]] = get_queries_for_doc(doc_name, questions_df)
     q_texts = [q for _t, q in queries]
 
+    if not queries:
+        return [], {"doc_id": doc_name, "n_questions": 0, "skipped": "no_queries"}
+
     chunks: List[str] = chunker.chunk(doc_path)
     index = retriever.build_index(chunks)
-    idxs: List[int] = retriever.retrieve(index, q_texts, top_k=top_k)
+    idxs: List[int] = retriever.retrieve(index, q_texts, top_k=int(top_k))
+    idxs = _dedupe_ints_keep_order(idxs)
 
-    # contexts는 list[str] 유지 (RAGAS 입력)
     contexts: List[str] = [chunks[int(i)] for i in idxs if 0 <= int(i) < len(chunks)]
 
-    # generator는 내부에서 CONFIG["max_context_chars"]로 자름 (동일 조건 보장)
     pred_map: Dict[str, str] = generator.generate(queries, "".join(contexts))
-
     gold_map = _gold_map_for_doc(gold_fields_df, doc_name)
 
     rows: List[Dict[str, Any]] = []
@@ -115,8 +111,8 @@ def build_ragas_rows_for_doc(
             {
                 "user_input": str(question),
                 "response": (pred_map.get(field, "") or "").strip(),
-                "retrieved_contexts": contexts,  # list[str]
-                "reference": gold_map.get(str(field), None),  # str|None
+                "retrieved_contexts": contexts,
+                "reference": gold_map.get(str(field), None),
                 "doc_id": doc_name,
                 "field": str(field),
             }
@@ -135,7 +131,7 @@ def build_ragas_rows_for_doc(
 
 
 # ------------------------------------------------------------
-# GPT-5 evaluator (Responses API) - no temperature
+# GPT-5 evaluator (Responses API)
 # ------------------------------------------------------------
 JUDGE_PROMPT = """너는 RAG 시스템 답변을 평가하는 엄격한 평가자다.
 아래 입력을 보고, JSON 형식으로만 평가 결과를 출력하라. 설명/코드블록/추가 텍스트 금지.
@@ -172,7 +168,7 @@ def _clip01(x: Any) -> Optional[float]:
         if x is None:
             return None
         v = float(x)
-        if v != v:  # NaN
+        if v != v:
             return None
         if v < 0.0:
             return 0.0
@@ -191,10 +187,6 @@ def run_ragas_gpt5(
     max_output_tokens: int = 500,
     reasoning_effort: str = "minimal",
 ) -> pd.DataFrame:
-    """
-    GPT-5 Responses API로 RAGAS 스타일 지표(3개)를 계산.
-    ✅ rows가 비어있거나 judge 실패해도 '스키마 고정 DF'를 반환하도록 보장.
-    """
     expected_cols = [
         "exp_id", "chunker", "retriever", "generator",
         "doc_id", "field", "user_input",
@@ -243,7 +235,6 @@ def run_ragas_gpt5(
             acorr = None if acorr is None else _clip01(acorr)
 
         except Exception:
-            # 실패하면 None 유지
             pass
 
         out_rows.append(
@@ -262,8 +253,6 @@ def run_ragas_gpt5(
         )
 
     df = pd.DataFrame(out_rows)
-
-    # ✅ 컬럼 누락 방지: expected_cols가 없으면 생성
     for c in expected_cols:
         if c not in df.columns:
             df[c] = None
@@ -295,6 +284,9 @@ def run_experiment_with_ragas(
     compute_baseline_doc_metrics: bool = True,
     gold_evidence_df: Optional[pd.DataFrame] = None,
     sim_threshold: int = 80,
+    # ✅ 추가: RAGAS 컨텍스트 K
+    context_k: Optional[int] = None,
+    # judge 옵션
     judge_max_context_chars_per_sample: int = 6000,
     judge_max_output_tokens: int = 500,
     judge_reasoning_effort: str = "minimal",
@@ -311,9 +303,10 @@ def run_experiment_with_ragas(
     gold_fields_df = load_gold_fields_jsonl(gold_fields_jsonl_path)
 
     chunker, retriever, generator = make_components(spec, embed_model=embed_model, client=client)
-    top_k = int(CONFIG.get("top_k", 15))
 
-    # 1) build ragas rows for all docs
+    # ✅ CONFIG top_k가 아니라, 외부에서 넘어온 context_k를 우선 사용
+    top_k = int(context_k) if context_k is not None else int(CONFIG.get("top_k", 15))
+
     all_rows: List[Dict[str, Any]] = []
     for dp in tqdm([Path(p) for p in run_docs], desc=f"RAG + RAGAS | exp {spec.exp_id}"):
         rows, _meta = build_ragas_rows_for_doc(
@@ -332,7 +325,6 @@ def run_experiment_with_ragas(
             r["generator"] = spec.generator
         all_rows.extend(rows)
 
-    # 2) judge (GPT-5)
     ragas_sample_df = run_ragas_gpt5(
         rows=all_rows,
         client=client,
@@ -342,14 +334,12 @@ def run_experiment_with_ragas(
         reasoning_effort=judge_reasoning_effort,
     )
 
-    # ✅ keep_cols 방어: 없으면 만들어서 KeyError 방지
     keep_cols = ["exp_id","chunker","retriever","generator","doc_id","field","user_input"] + ragas_metrics
     for c in keep_cols:
         if c not in ragas_sample_df.columns:
             ragas_sample_df[c] = None
     ragas_sample_df = ragas_sample_df[keep_cols].copy()
 
-    # 3) doc-level avg
     if len(ragas_sample_df) == 0:
         ragas_doc_df = pd.DataFrame(columns=["doc_id"] + ragas_metrics)
         ragas_exp_df = pd.DataFrame([{"exp_id": spec.exp_id, **{m: float("nan") for m in ragas_metrics}}])
@@ -358,7 +348,6 @@ def run_experiment_with_ragas(
         exp_avg = ragas_sample_df[ragas_metrics].mean(numeric_only=True)
         ragas_exp_df = pd.DataFrame([{"exp_id": spec.exp_id, **{k: float(exp_avg[k]) for k in exp_avg.index}}])
 
-    # 4) baseline doc metrics (optional)
     if compute_baseline_doc_metrics:
         if gold_evidence_df is None:
             raise ValueError("compute_baseline_doc_metrics=True면 gold_evidence_df를 넘겨줘야 함")
@@ -380,7 +369,6 @@ def run_experiment_with_ragas(
             m["retriever"] = spec.retriever
             m["generator"] = spec.generator
             doc_rows.append(m)
-
         doc_metrics_df = pd.DataFrame(doc_rows)
     else:
         doc_metrics_df = pd.DataFrame([])
