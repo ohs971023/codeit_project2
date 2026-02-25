@@ -38,7 +38,7 @@ extract_text = pp.extract_text
 chunk_from_alldata = getattr(pp, "chunk_from_alldata", None)
 
 # =========================================================
-# PDF 겹침으로 생기는 반복문자(4회 이상) 축약 → 1개로
+# PDF 겹침 반복문자(4회 이상) -> 1개
 # =========================================================
 _REPEAT_CHAR_4PLUS = re.compile(r"(.)\1{3,}")
 
@@ -50,7 +50,7 @@ def squash_repeated_chars(text: str) -> str:
 
 def _dedupe_ints_keep_order(xs: List[int]) -> List[int]:
     seen = set()
-    out = []
+    out: List[int] = []
     for x in xs or []:
         try:
             xi = int(x)
@@ -62,13 +62,40 @@ def _dedupe_ints_keep_order(xs: List[int]) -> List[int]:
         out.append(xi)
     return out
 
+def _clip_k(x: Optional[int], default: int) -> int:
+    try:
+        v = int(x) if x is not None else int(default)
+    except Exception:
+        v = int(default)
+    return max(1, v)
+
+def _resolve_3k(
+    retrieve_k: Optional[int],
+    context_k: Optional[int],
+    recall_k: Optional[int],
+    top_k_fallback: int,
+) -> tuple[int, int, int]:
+    """
+    3-K 표준화:
+      - retrieve_k >= max(context_k, recall_k)
+    """
+    ctx = _clip_k(context_k, top_k_fallback)
+    rcl = _clip_k(recall_k, top_k_fallback)
+    rtv = _clip_k(retrieve_k, max(top_k_fallback, ctx, rcl))
+
+    if rtv < ctx:
+        rtv = ctx
+    if rtv < rcl:
+        rtv = rcl
+    return rtv, ctx, rcl
+
 
 # -------------------------
 # Config / Prompt
 # -------------------------
 CONFIG = {
     "chunk_length": 1200,
-    "top_k": 20,                  # (구버전) 기본 검색 K
+    "top_k": 20,                  # (구버전 fallback)
     "max_tokens": 2000,
     "max_completion_tokens": 2000,
     "temperature": 0.1,
@@ -318,21 +345,6 @@ class OpenAIGenerator(BaseGenerator):
         questions_json = json.dumps(q_payload, ensure_ascii=False)
         prompt = RFP_PROMPT.format(questions_json=questions_json, context=context)
 
-        self.last_raw_text = ""
-        self.last_resp_dump = None
-        self.last_debug = {
-            "model": self.model,
-            "n_questions": len(queries),
-            "context_len": len(context or ""),
-            "max_context_chars": MAX_CTX_CHARS,
-            "prompt_len": len(prompt),
-            "response_status": None,
-            "output_tokens": None,
-            "output_text_repr": None,
-            "exception": None,
-            "parse_error": None,
-        }
-
         def all_sentinel(s: str) -> Dict[str, str]:
             return {k: s for k, _ in queries}
 
@@ -343,27 +355,19 @@ class OpenAIGenerator(BaseGenerator):
                 max_output_tokens=CONFIG.get("max_completion_tokens", 2000),
                 reasoning={"effort": "minimal"},
             )
-            self.last_resp_dump = resp.model_dump() if hasattr(resp, "model_dump") else None
-            self.last_debug["response_status"] = getattr(resp, "status", None)
-
-            usage = getattr(resp, "usage", None)
-            self.last_debug["output_tokens"] = getattr(usage, "output_tokens", None)
 
             text = (getattr(resp, "output_text", "") or "").strip()
             self.last_raw_text = text
-            self.last_debug["output_text_repr"] = repr(text[:200])
 
             if not text:
                 return all_sentinel(GEN_FAIL)
 
             try:
                 obj = json.loads(text)
-            except Exception as e:
-                self.last_debug["parse_error"] = repr(e)
+            except Exception:
                 return all_sentinel(GEN_FAIL)
 
             if not isinstance(obj, dict):
-                self.last_debug["parse_error"] = f"non-dict-json: {type(obj)}"
                 return all_sentinel(GEN_FAIL)
 
             out: Dict[str, str] = {}
@@ -376,8 +380,7 @@ class OpenAIGenerator(BaseGenerator):
                 out[k] = v if v else GEN_FAIL
             return out
 
-        except Exception as e:
-            self.last_debug["exception"] = repr(e)
+        except Exception:
             self.last_raw_text = ""
             return all_sentinel(GEN_FAIL)
 
@@ -431,106 +434,22 @@ class RAGExperiment:
         self.generator = generator
         self.questions_df = questions_df
 
-    def run_single_doc_metrics_singleq(
-        self,
-        doc_path: Path,
-        gold_fields_df: pd.DataFrame,
-        gold_evidence_df: pd.DataFrame,
-        *,
-        context_k: Optional[int] = None,
-        recall_k: Optional[int] = None,
-        top_k: int = 20,  # (구버전 호환)
-        sim_threshold: int = 80,
-    ) -> Dict[str, Any]:
-        """
-        ✅ 질문별 retrieve
-        - context_k: LLM context에 사용할 K
-        - recall_k : ret_recall/mrr 계산용 K
-        """
-        doc_name = unicodedata.normalize("NFC", doc_path.name)
-
-        ctx_k = int(context_k) if context_k is not None else int(top_k)
-        ret_k = int(recall_k) if recall_k is not None else int(top_k)
-        if ret_k < ctx_k:
-            ret_k = ctx_k
-
-        queries = get_queries_for_doc(doc_name, self.questions_df)
-        chunks = self.chunker.chunk(doc_path)
-        index = self.retriever.build_index(chunks)
-
-        qdf = gold_fields_df[gold_fields_df["doc_id"].astype(str) == doc_name].copy()
-        GOLD_ANCHOR = build_gold_anchor_map(gold_evidence_df)
-
-        pred_map: Dict[str, str] = {}
-        g_list: List[Dict[str, float]] = []
-        r_list: List[Dict[str, float]] = []
-
-        for field, question in queries:
-            idxs = self.retriever.retrieve(index, [question], top_k=ctx_k)
-            idxs = _dedupe_ints_keep_order(idxs)
-            context = "".join(chunks[int(i)] for i in idxs if 0 <= int(i) < len(chunks))
-
-            one_pred = self.generator.generate([(field, question)], context)
-            pred = (one_pred.get(field) or "").strip()
-            pred_map[field] = pred
-
-            gold_row = qdf[qdf["field"].astype(str) == str(field)]
-            gold = gold_row["gold"].iloc[0] if not gold_row.empty else None
-            g_list.append(eval_gen(pred, gold, threshold=sim_threshold))
-
-            eval_idxs = idxs[:ret_k]
-            for _, row in qdf[qdf["field"].astype(str) == str(field)].iterrows():
-                iid = str(row["instance_id"])
-                anchors = GOLD_ANCHOR.get(iid, [])
-                if anchors:
-                    r_list.append(eval_retrieval_by_anchor(chunks, eval_idxs, anchors))
-                else:
-                    r_list.append({"recall": np.nan, "mrr": np.nan})
-
-        metrics: Dict[str, Any] = {
-            "doc_id": doc_name,
-            "context_k": int(ctx_k),
-            "recall_k": int(ret_k),
-
-            "n_questions": int(len(qdf)),
-            "chunk_count": int(len(chunks)),
-            "pred_map": pred_map,
-
-            "ret_recall": float(np.nanmean([x["recall"] for x in r_list])) if r_list else np.nan,
-            "ret_mrr": float(np.nanmean([x["mrr"] for x in r_list])) if r_list else np.nan,
-
-            "gen_fill": float(np.nanmean([x["fill"] for x in g_list])) if g_list else np.nan,
-            "gen_match": float(np.nanmean([x["match"] for x in g_list])) if g_list else np.nan,
-            "gen_sim": float(np.nanmean([x["sim"] for x in g_list])) if g_list else np.nan,
-        }
-
-        del chunks, index, qdf, r_list, g_list, queries, GOLD_ANCHOR, pred_map
-        gc.collect()
-        return metrics
-
     def run_single_doc_metrics(
         self,
         doc_path: Path,
         gold_fields_df: pd.DataFrame,
         gold_evidence_df: pd.DataFrame,
         *,
+        retrieve_k: Optional[int] = None,
         context_k: Optional[int] = None,
         recall_k: Optional[int] = None,
-        top_k: int = 20,  # (구버전 호환)
+        top_k: int = 20,  # 구버전 fallback
         sim_threshold: int = 80,
         warn_on_mismatch: bool = True,
     ) -> Dict[str, Any]:
-        """
-        ✅ 문서 단위: 전체 질문을 한 번에 보고 context 생성
-        - context_k: LLM context에 사용할 K
-        - recall_k : ret_recall/mrr 계산용 K
-        """
         doc_name = unicodedata.normalize("NFC", doc_path.name)
 
-        ctx_k = int(context_k) if context_k is not None else int(top_k)
-        ret_k = int(recall_k) if recall_k is not None else int(top_k)
-        if ret_k < ctx_k:
-            ret_k = ctx_k
+        rtv_k, ctx_k, rcl_k = _resolve_3k(retrieve_k, context_k, recall_k, top_k)
 
         queries = get_queries_for_doc(doc_name, self.questions_df)
         q_texts = [q for _t, q in queries]
@@ -539,10 +458,13 @@ class RAGExperiment:
         chunks = self.chunker.chunk(doc_path)
         index = self.retriever.build_index(chunks)
 
-        idxs = self.retriever.retrieve(index, q_texts, top_k=ctx_k)
+        idxs = self.retriever.retrieve(index, q_texts, top_k=rtv_k)
         idxs = _dedupe_ints_keep_order(idxs)
 
-        context = "".join(chunks[int(i)] for i in idxs if 0 <= int(i) < len(chunks))
+        ctx_idxs = idxs[:ctx_k]
+        eval_idxs = idxs[:rcl_k]
+
+        context = "".join(chunks[int(i)] for i in ctx_idxs if 0 <= int(i) < len(chunks))
         pred_map = self.generator.generate(queries, context)
 
         answers = [pred_map.get(t, "NOT_FOUND") for t in type_keys]
@@ -558,14 +480,6 @@ class RAGExperiment:
         qdf = gold_fields_df[gold_fields_df["doc_id"].astype(str) == doc_name].copy()
         GOLD_ANCHOR = build_gold_anchor_map(gold_evidence_df)
 
-        answers_preview = [str(x) for x in (answers[:5] if answers else [])]
-        n_nonempty_answers = int(sum(1 for a in (answers or []) if str(a).strip()))
-        n_notfound_answers = int(sum(1 for a in (answers or []) if str(a).strip().lower() in {"notfound", "not_found", "없음"}))
-
-        raw_text = getattr(self.generator, "last_raw_text", None)
-        raw_text_len = None if raw_text is None else int(len(str(raw_text).strip()))
-        raw_text_preview = None if raw_text is None else str(raw_text)[:200]
-
         g_list: List[Dict[str, float]] = []
         preds: List[str] = []
 
@@ -580,11 +494,6 @@ class RAGExperiment:
             g = eval_gen(pred_s, gold, threshold=sim_threshold)
             g_list.append(g)
 
-        pred_preview = preds[:5]
-        n_nonempty_preds = int(sum(1 for p in preds if str(p).strip()))
-        n_notfound_preds = int(sum(1 for p in preds if str(p).strip().lower() in {"notfound", "not_found", "없음"}))
-
-        eval_idxs = idxs[:ret_k]
         r_list: List[Dict[str, float]] = []
         for _, row in qdf.iterrows():
             iid = str(row["instance_id"])
@@ -596,34 +505,24 @@ class RAGExperiment:
 
         metrics: Dict[str, Any] = {
             "doc_id": doc_name,
+            "retrieve_k": int(rtv_k),
             "context_k": int(ctx_k),
-            "recall_k": int(ret_k),
-
-            "expected_answer_count": int(expected_answer_count),
-            "answer_count": int(answer_count),
+            "recall_k": int(rcl_k),
 
             "n_questions": int(len(qdf)),
             "chunk_count": int(len(chunks)),
             "context_length": int(len(context)),
 
-            "raw_text_len": raw_text_len,
-            "raw_text_preview": raw_text_preview,
-            "answers_preview": answers_preview,
-            "n_nonempty_answers": n_nonempty_answers,
-            "n_notfound_answers": n_notfound_answers,
-            "pred_preview": pred_preview,
-            "n_nonempty_preds": n_nonempty_preds,
-            "n_notfound_preds": n_notfound_preds,
-
             "pred_map": pred_map,
 
-            # ✅ ret_* 는 recall_k 기준으로 계산된 값
-            "ret_recall": float(np.nanmean([x["recall"] for x in r_list])),
-            "ret_mrr": float(np.nanmean([x["mrr"] for x in r_list])),
+            # ret_* 는 recall_k 기준
+            "ret_recall": float(np.nanmean([x["recall"] for x in r_list])) if r_list else np.nan,
+            "ret_mrr": float(np.nanmean([x["mrr"] for x in r_list])) if r_list else np.nan,
 
-            "gen_fill": float(np.nanmean([x["fill"] for x in g_list])),
-            "gen_match": float(np.nanmean([x["match"] for x in g_list])),
-            "gen_sim": float(np.nanmean([x["sim"] for x in g_list])),
+            # gen_* 는 context_k 기준 입력으로 생성된 결과
+            "gen_fill": float(np.nanmean([x["fill"] for x in g_list])) if g_list else np.nan,
+            "gen_match": float(np.nanmean([x["match"] for x in g_list])) if g_list else np.nan,
+            "gen_sim": float(np.nanmean([x["sim"] for x in g_list])) if g_list else np.nan,
         }
 
         del chunks, index, context, answers, qdf, r_list, g_list, idxs, queries, q_texts, GOLD_ANCHOR, preds, pred_map

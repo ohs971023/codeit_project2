@@ -26,17 +26,11 @@ from core.render import (
     find_pages_for_queries,
 )
 
-# =========================================================
-# Path bootstrap: notebooks on sys.path
-# =========================================================
-ROOT = Path(__file__).resolve().parents[1]     # .../streamlit_app -> repo root
+ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOKS = ROOT / "notebooks"
 if str(NOTEBOOKS) not in sys.path:
     sys.path.insert(0, str(NOTEBOOKS))
 
-# =========================================================
-# Init
-# =========================================================
 paths = AppPaths()
 cfg = AppConfig()
 
@@ -46,14 +40,17 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 FIXED_CONFIG_PY = paths.repo_root / "streamlit_app" / "core" / "fixed_config.py"
 
-# ✅ 서비스/평가 값 섞이지 않게: 서비스 설정은 service_* prefix로 저장
 DEFAULT_CFG = {
-    # ---- 서비스용 ----
-    "service_chunk_mode": "precomputed",  # "precomputed" | "runtime_c1"
-    "pp_version": "pp_v5",                # precomputed일 때만 의미
-    "chunk_length": 1200,                 # runtime_c1 chunk length / 전처리 size
-    "service_context_k": 8,               # LLM 입력 K
-    "service_recall_k": 20,               # 검색 K (>= context_k 권장)
+    # 서비스용
+    "service_chunk_mode": "precomputed",
+    "pp_version": "pp_v5",
+    "chunk_length": 1200,
+
+    # ✅ 3-K (서비스는 보통 retrieve/context만 쓰지만, 설정은 3개 다 제공)
+    "service_retrieve_k": 20,
+    "service_context_k": 8,
+    "service_recall_k": 20,   # 서비스는 지표 계산 안 하므로 기본은 retrieve_k로 맞춤
+
     "alpha": 0.7,
     "max_context_chars": 2500,
     "max_completion_tokens": 800,
@@ -62,15 +59,12 @@ DEFAULT_CFG = {
     "candidate_max": 12,
     "max_pages_scan": 200,
 
-    # ---- (구버전 호환) ----
+    # 구버전 호환
     "top_k": 8,
 }
 
 WEAK_KEYWORDS = ["예산", "사업비", "소요예산", "부가가치세", "VAT", "계약", "입찰", "기간", "마감", "제출", "기관", "요구사항"]
 
-# =========================================================
-# Streamlit UI
-# =========================================================
 st.set_page_config(page_title="RAG Chat Service", layout="wide")
 st.title("🤖 RAG 서비스 / 🧪 실험·평가")
 
@@ -85,9 +79,6 @@ pp_versions = detect_available_pp_versions(paths) or ["pp_v5", "pp_v6", "pp_v4"]
 tab_service, tab_exp_eval = st.tabs(["🟢 서비스(채팅)", "🧪 실험/평가(설정/평가)"])
 
 
-# =========================================================
-# module caches (평가용)
-# =========================================================
 @st.cache_resource(show_spinner=False)
 def cached_import(module_name: str):
     return importlib.import_module(module_name)
@@ -103,9 +94,6 @@ def cached_openai_client(api_key: str):
     return OpenAI(api_key=api_key)
 
 
-# =========================================================
-# Config IO
-# =========================================================
 def load_cfg() -> Dict[str, Any]:
     if SERVICE_CFG_PATH.exists():
         try:
@@ -119,9 +107,6 @@ def save_cfg(cfg_obj: Dict[str, Any]) -> None:
     SERVICE_CFG_PATH.write_text(json.dumps(cfg_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# =========================================================
-# 01_index_pages.json 로드 (목차 페이지 스킵용)
-# =========================================================
 @st.cache_data(show_spinner=False)
 def load_index_pages(path_str: str) -> dict:
     p = Path(path_str)
@@ -157,9 +142,6 @@ def get_front_pages(doc_id: str) -> List[tuple]:
     return result
 
 
-# =========================================================
-# Chat: 세션 내 문서별 유지(재시작 시 초기화)
-# =========================================================
 def ensure_chat_state():
     if "doc_messages" not in st.session_state:
         st.session_state["doc_messages"] = {}
@@ -190,9 +172,6 @@ def switch_doc(doc_id: str):
             st.session_state.pop(k, None)
 
 
-# =========================================================
-# Retrieval helpers (서비스 탭)
-# =========================================================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -311,9 +290,6 @@ def sync_auto_navigate(target_phys: int, start_page: int, n_pages: int):
     st.session_state["svc_pending_apply"] = True
 
 
-# =========================================================
-# Eval helpers
-# =========================================================
 def _to_float_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
@@ -321,21 +297,6 @@ def standardize_eval_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
         return df
     out = df.copy()
-    colmap = {
-        "ret_recall": ["ret_recall", "retrieval_recall@k", "retrieval_recall", "recall@k"],
-        "ret_mrr": ["ret_mrr", "retrieval_mrr@k", "retrieval_mrr", "mrr@k"],
-        "gen_fill": ["gen_fill", "gen_fill_rate", "generation_fill_rate"],
-        "gen_match": ["gen_match", "gen_match_rate", "generation_match_rate"],
-        "gen_sim": ["gen_sim", "gen_avg_similarity", "generation_avg_similarity"],
-    }
-    for std, cands in colmap.items():
-        found = None
-        for c in cands:
-            if c in out.columns:
-                found = c
-                break
-        if found and found != std:
-            out.rename(columns={found: std}, inplace=True)
     for c in ["ret_recall", "ret_mrr", "gen_fill", "gen_match", "gen_sim"]:
         if c in out.columns:
             out[c] = _to_float_series(out[c])
@@ -356,7 +317,7 @@ def merge_eval_and_ragas(doc_metrics_df: pd.DataFrame, ragas_doc_df: Optional[pd
         return left
     right = standardize_ragas_columns(ragas_doc_df.copy())
     if "doc_id" in left.columns and "doc_id" in right.columns:
-        return left.merge(right, on="doc_id", how="left", suffixes=("", "_ragas"))
+        return left.merge(right, on="doc_id", how="left")
     return left
 
 def make_mean_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -373,9 +334,6 @@ def make_mean_table(df: pd.DataFrame) -> pd.DataFrame:
     return means.to_frame(name="mean").reset_index().rename(columns={"index": "metric"})
 
 
-# =========================================================
-# Monkeypatch: pp_v6 page=None 오류 런타임 해결
-# =========================================================
 def monkeypatch_pp_v6_table_title_guard():
     try:
         ppv6 = cached_import("preprocess.pp_v6")
@@ -427,9 +385,9 @@ def monkeypatch_pp_v6_table_title_guard():
     ppv6._find_table_title = _find_table_title_safe
 
 
-# =========================================================
-# 🟢 서비스(채팅)
-# =========================================================
+# -------------------------
+# 서비스 탭
+# -------------------------
 with tab_service:
     cfg_service = load_cfg()
 
@@ -470,26 +428,8 @@ with tab_service:
 
         show_hl = st.checkbox("하이라이트 보기(확정 페이지에서만)", value=True, disabled=(not confirmed_pages))
 
-        if front_pages:
-            st.caption("앞부분 바로 보기")
-            btn_cols = st.columns(len(front_pages))
-            for col, (phys_p, lbl) in zip(btn_cols, front_pages):
-                if col.button(lbl, key=f"svc_front_{phys_p}"):
-                    sync_auto_navigate(phys_p, start_page, n_pages)
-                    st.session_state["svc_candidate_hl_once"] = False
-                    st.rerun()
-
         content_max = max(1, n_pages - offset)
-
-        if "svc_pv_page_input" in st.session_state:
-            default_content_p = int(st.session_state["svc_pv_page_input"])
-        elif confirmed_pages:
-            default_content_p = max(1, min(int(confirmed_pages[0]) - offset, content_max))
-        elif candidate_pages:
-            default_content_p = max(1, min(int(candidate_pages[0]) - offset, content_max))
-        else:
-            default_content_p = 1
-
+        default_content_p = int(st.session_state.get("svc_pv_page_input", 1))
         default_content_p = max(1, min(default_content_p, content_max))
 
         def _svc_page_changed():
@@ -513,16 +453,10 @@ with tab_service:
             st.session_state["svc_render_phys"] = int(page_to_view)
         page_to_view = int(page_to_view)
 
+        caption = f"p.{page_to_view - offset}" if page_to_view >= start_page else f"앞부분 (물리 p.{page_to_view})"
+
         is_confirmed = page_to_view in confirmed_pages
         is_candidate = page_to_view in candidate_pages
-        is_front = page_to_view < start_page
-
-        if is_front:
-            front_label = next((lbl for p, lbl in front_pages if p == page_to_view), "앞부분")
-            caption = f"{front_label} (물리 p.{page_to_view})"
-        else:
-            caption = f"p.{page_to_view - offset}"
-
         cand_once = bool(st.session_state.get("svc_candidate_hl_once", False))
         allow_cand_render = bool(allow_candidate_hl and is_candidate and cand_once)
 
@@ -539,34 +473,13 @@ with tab_service:
             st.error("페이지 렌더링 실패")
             st.exception(e)
 
-        if candidate_pages:
-            cand_content = [max(1, p - offset) for p in candidate_pages if p >= start_page]
-            st.markdown("**🟡 후보 페이지(클릭해서 이동)**")
-
-            row = []
-            max_show = int(cfg_service["candidate_max"])
-            show_list = cand_content[:max_show]
-            for idx, cp in enumerate(show_list):
-                row.append(cp)
-                if len(row) == 6 or idx == len(show_list) - 1:
-                    cols = st.columns(len(row))
-                    for c, page_num in zip(cols, row):
-                        if c.button(f"{page_num}", key=f"cand_{doc_id}_{page_num}_{idx}"):
-                            phys = int(page_num) + offset
-                            sync_auto_navigate(phys, start_page, n_pages)
-                            st.session_state["svc_candidate_hl_once"] = bool(allow_candidate_hl)
-                            st.rerun()
-                    row = []
-        else:
-            st.caption("후보 페이지 없음")
-
     with col_chat:
         st.subheader("💬 채팅")
         for m in st.session_state.get("messages", []):
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-        user_msg = st.chat_input("질문을 입력하세요 (예: 사업명/예산/계약방식/기간/마감/기관/요구사항)")
+        user_msg = st.chat_input("질문을 입력하세요")
 
         if user_msg:
             api_key = cfg.openai_api_key
@@ -575,32 +488,25 @@ with tab_service:
                 st.stop()
 
             st.session_state["messages"].append({"role": "user", "content": user_msg})
-            with st.chat_message("user"):
-                st.markdown(user_msg)
-
             with st.chat_message("assistant"):
                 with st.spinner("검색/답변 생성 중..."):
-                    service_chunk_mode = str(cfg_service.get("service_chunk_mode", "precomputed"))
-                    service_pp = str(cfg_service.get("pp_version", "pp_v5"))
-
-                    svc_ctx_k = int(cfg_service.get("service_context_k", cfg_service.get("top_k", 8)))
-                    svc_ret_k = int(cfg_service.get("service_recall_k", max(svc_ctx_k, int(cfg_service.get("top_k", 8)))))
-
-                    if svc_ret_k < svc_ctx_k:
-                        svc_ret_k = svc_ctx_k
-
+                    mode = str(cfg_service.get("service_chunk_mode", "precomputed"))
+                    ppver = str(cfg_service.get("pp_version", "pp_v5"))
                     chunk_len = int(cfg_service.get("chunk_length", 1200))
 
-                    # -------- chunks 로드 --------
-                    if service_chunk_mode == "precomputed":
-                        jsonl = paths.chunks_dir / service_pp / f"{doc_id}.jsonl"
+                    svc_rtv = int(cfg_service.get("service_retrieve_k", 20))
+                    svc_ctx = int(cfg_service.get("service_context_k", 8))
+                    if svc_rtv < svc_ctx:
+                        svc_rtv = svc_ctx
+
+                    if mode == "precomputed":
+                        jsonl = paths.chunks_dir / ppver / f"{doc_id}.jsonl"
                         if not jsonl.exists():
-                            ok, msg = run_preprocessing(service_pp, doc_id, int(chunk_len), paths)
+                            ok, msg = run_preprocessing(ppver, doc_id, int(chunk_len), paths)
                             if not ok:
-                                st.error("전처리 생성 실패 → 서비스 실행을 중단합니다.")
+                                st.error("전처리 생성 실패")
                                 st.write(msg)
                                 st.stop()
-
                         chunks, artifact_path = get_chunks(
                             doc_id=doc_id,
                             pdf_path=pdf_path,
@@ -608,9 +514,9 @@ with tab_service:
                             source="precomputed_chunks",
                             precomputed_jsonl=jsonl,
                         )
-                        source_key = f"precomputed__{service_pp}"
+                        source_key = f"precomputed__{ppver}"
 
-                    elif service_chunk_mode == "runtime_c1":
+                    else:  # runtime_c1
                         chunks, artifact_path = get_chunks(
                             doc_id=doc_id,
                             pdf_path=pdf_path,
@@ -620,10 +526,6 @@ with tab_service:
                         )
                         source_key = f"runtime_c1__len{chunk_len}"
 
-                    else:
-                        st.error(f"Unknown service_chunk_mode: {service_chunk_mode}")
-                        st.stop()
-
                     retriever = build_or_load_hybrid(
                         chunks=chunks,
                         index_dir=paths.index_dir,
@@ -632,22 +534,21 @@ with tab_service:
                         artifact_path=artifact_path,
                     )
 
-                    results_all = retriever.search(user_msg, k=int(svc_ret_k), alpha=float(cfg_service["alpha"]))
-                    results_llm = (results_all or [])[: int(svc_ctx_k)]
+                    results_all = retriever.search(user_msg, k=svc_rtv, alpha=float(cfg_service["alpha"]))
+                    results_llm = (results_all or [])[:svc_ctx]
 
                     ev = evidence_text(results_llm, max_chars=int(cfg_service["max_context_chars"]))
-                    prov_pages = provisional_pages_from_results(results_llm, max_pages=3)
+                    pages = provisional_pages_from_results(results_llm, max_pages=3)
 
                     raw_answer = summarize_with_evidence(
                         api_key=api_key,
                         model="gpt-5-mini",
                         query=user_msg,
                         evidence=ev,
-                        pages=prov_pages,
+                        pages=pages,
                         temperature=float(cfg_service["temperature"]),
                         max_completion_tokens=int(cfg_service["max_completion_tokens"]),
                     )
-
                     answer = clean_answer_remove_page_lines(raw_answer)
                     st.markdown(answer)
 
@@ -660,45 +561,26 @@ with tab_service:
                         strong_q,
                         weak_q,
                         cfg_service,
-                        fallback_pages=prov_pages,
+                        fallback_pages=pages,
                         start_page=get_start_page(doc_id),
                     )
-
                     st.session_state["svc_confirmed_pages"] = confirmed
                     st.session_state["svc_candidate_pages"] = candidates
                     st.session_state["svc_highlight_queries"] = strong_q if confirmed else []
 
-                    target = None
-                    if confirmed:
-                        target = confirmed[0]
-                    elif candidates:
-                        target = candidates[0]
-                    elif prov_pages:
-                        target = prov_pages[0]
-
-                    if target is not None:
-                        sync_auto_navigate(int(target), get_start_page(doc_id), n_pages)
-                        st.session_state["svc_candidate_hl_once"] = False
-
-                    st.session_state["messages"].append({"role": "assistant", "content": answer})
-                    st.rerun()
+            st.session_state["messages"].append({"role": "assistant", "content": answer})
+            st.rerun()
 
 
-# =========================================================
-# 🧪 실험/평가(설정 변경 + 평가 실행)
-# =========================================================
+# -------------------------
+# 설정/평가 탭
+# -------------------------
 with tab_exp_eval:
-    st.subheader("🧪 실험/평가 설정")
-    st.caption("상단(서비스 설정)은 저장 시 서비스에 반영되고, 하단(평가)은 평가에만 적용됩니다.")
-
+    st.subheader("🧪 실험/평가(설정/평가)")
     cfg_now = load_cfg()
 
-    # -------------------------
-    # ✅ 서비스 설정(저장 시 서비스에 반영)
-    # -------------------------
     st.markdown("### ✅ 서비스 설정(저장 시 서비스에 반영)")
     colA, colB = st.columns(2)
-
     with colA:
         service_chunk_mode = st.selectbox(
             "서비스 chunk mode",
@@ -712,18 +594,11 @@ with tab_exp_eval:
         )
         chunk_length = st.slider("chunk_length (서비스 runtime_c1 & 전처리 size)", 300, 4000, int(cfg_now["chunk_length"]), 100)
 
-        service_context_k = st.slider(
-            "service context_K (LLM 입력 K)",
-            2, 40,
-            int(cfg_now.get("service_context_k", cfg_now.get("top_k", 8))),
-            1
-        )
-        service_recall_k = st.slider(
-            "service recall_K (검색 K, context_K 이상 권장)",
-            2, 80,
-            int(cfg_now.get("service_recall_k", max(service_context_k, int(cfg_now.get("top_k", 8))))),
-            1
-        )
+        service_retrieve_k = st.slider("service retrieve_K (검색 후보 K)", 2, 120, int(cfg_now.get("service_retrieve_k", 20)), 1)
+        service_context_k = st.slider("service context_K (LLM 입력 K)", 2, 60, int(cfg_now.get("service_context_k", 8)), 1)
+
+        # 서비스는 지표 계산 안 하지만, 3-K 스키마 유지용
+        service_recall_k = st.slider("service recall_K (보관용, 보통 retrieve_K로)", 2, 120, int(cfg_now.get("service_recall_k", int(cfg_now.get("service_retrieve_k", 20)))), 1)
 
     with colB:
         alpha = st.slider("alpha(hybrid)", 0.0, 1.0, float(cfg_now["alpha"]), 0.05)
@@ -734,22 +609,26 @@ with tab_exp_eval:
         candidate_max = st.slider("candidate_max", 5, 30, int(cfg_now["candidate_max"]), 1)
         max_pages_scan = st.slider("max_pages_scan", 10, 400, int(cfg_now["max_pages_scan"]), 10)
 
-    if service_recall_k < service_context_k:
-        st.warning("service recall_K가 context_K보다 작습니다. 저장 시 recall_K를 context_K로 올려서 저장합니다.")
+    if service_retrieve_k < service_context_k:
+        st.warning("service retrieve_K는 context_K 이상이어야 합니다. 저장 시 retrieve_K를 context_K로 올립니다.")
 
     if st.button("✅ 저장 → 서비스 반영 + fixed_config.py 덮어쓰기"):
+        svc_rtv = int(service_retrieve_k)
         svc_ctx = int(service_context_k)
-        svc_ret = int(service_recall_k)
-        if svc_ret < svc_ctx:
-            svc_ret = svc_ctx
+        svc_rcl = int(service_recall_k)
+        if svc_rtv < svc_ctx:
+            svc_rtv = svc_ctx
+        if svc_rtv < svc_rcl:
+            svc_rtv = svc_rcl
 
         cfg_new = {
             "service_chunk_mode": str(service_chunk_mode),
             "pp_version": str(pp_version),
             "chunk_length": int(chunk_length),
 
+            "service_retrieve_k": int(svc_rtv),
             "service_context_k": int(svc_ctx),
-            "service_recall_k": int(svc_ret),
+            "service_recall_k": int(svc_rcl),
 
             "alpha": float(alpha),
             "max_context_chars": int(max_context_chars),
@@ -759,7 +638,6 @@ with tab_exp_eval:
             "candidate_max": int(candidate_max),
             "max_pages_scan": int(max_pages_scan),
 
-            # 구버전 호환: top_k도 남김
             "top_k": int(svc_ctx),
         }
         save_cfg(cfg_new)
@@ -769,38 +647,33 @@ with tab_exp_eval:
             "pp_version": str(pp_version),
             "chunk_length": int(chunk_length),
 
+            "service_retrieve_k": int(svc_rtv),
             "service_context_k": int(svc_ctx),
-            "service_recall_k": int(svc_ret),
+            "service_recall_k": int(svc_rcl),
 
             "alpha": float(alpha),
             "max_tokens": 2000,
             "max_completion_tokens": int(max_completion_tokens),
             "temperature": float(temperature),
             "max_context_chars": int(max_context_chars),
-
-            # 구버전 호환
             "top_k": int(svc_ctx),
         }
         write_fixed_config_py(FIXED_CONFIG_PY, fixed_out)
         st.success("저장 완료! 서비스 반영 + fixed_config.py 업데이트 완료")
 
-    # -------------------------
-    # 평가(평가 전용)
-    # -------------------------
     st.divider()
-    st.subheader("📊 평가 실행 (평가 전용 설정)")
-    st.caption("아래 설정은 저장되지 않으며, 평가 실행 시에만 적용됩니다(서비스 영향 없음).")
-
+    st.subheader("📊 평가 실행 (평가 전용 3-K)")
     eval_chunker = st.selectbox("chunker", ["C1", "C2", "C3", "C4"], index=0, key="eval_chunker")
     eval_retriever = st.selectbox("retriever", ["R1", "R2", "R3"], index=2, key="eval_retriever")
     eval_generator = st.selectbox("generator", ["G1", "G2"], index=0, key="eval_generator")
 
-    eval_context_k = st.slider("eval context_K (LLM 입력 K)", 2, 40, 8, 1, key="eval_context_k")
-    eval_recall_k = st.slider("eval recall_K (ret_recall@K 기준)", 2, 80, 20, 1, key="eval_recall_k")
-    if eval_recall_k < eval_context_k:
-        st.warning("eval recall_K가 context_K보다 작습니다. 실행 시 recall_K를 context_K로 맞춥니다.")
+    eval_retrieve_k = st.slider("eval retrieve_K (후보 K)", 2, 120, 30, 1, key="eval_retrieve_k")
+    eval_context_k = st.slider("eval context_K (LLM 입력 K)", 2, 60, 8, 1, key="eval_context_k")
+    eval_recall_k = st.slider("eval recall_K (ret_recall@K 기준)", 2, 120, 20, 1, key="eval_recall_k")
 
-    # ✅ 평가 전용 슬라이더(서비스값과 완전 분리)
+    if eval_retrieve_k < max(eval_context_k, eval_recall_k):
+        st.warning("eval retrieve_K는 max(context_K, recall_K) 이상이어야 합니다. 실행 시 자동 보정됩니다.")
+
     eval_chunk_length = st.slider("eval chunk_length", 300, 4000, 1200, 100, key="eval_chunk_length")
     eval_max_context_chars = st.slider("eval max_context_chars", 500, 12000, 6000, 100, key="eval_max_context_chars")
     eval_max_completion_tokens = st.slider("eval max_completion_tokens", 128, 4096, 2000, 64, key="eval_max_completion_tokens")
@@ -820,11 +693,10 @@ with tab_exp_eval:
             t0 = time.time()
             try:
                 monkeypatch_pp_v6_table_title_guard()
-
                 rag_experiment = cached_import("preprocess.rag_experiment")
                 ragas_eval = cached_import("preprocess.ragas_eval")
 
-                # ✅ 평가 전용 CONFIG 주입
+                # 평가 전용 CONFIG 주입
                 rag_experiment.CONFIG["chunk_length"] = int(eval_chunk_length)
                 rag_experiment.CONFIG["alpha"] = float(eval_alpha)
                 rag_experiment.CONFIG["max_context_chars"] = int(eval_max_context_chars)
@@ -834,73 +706,46 @@ with tab_exp_eval:
                 gold_evidence_df = pd.read_csv(paths.eval_dir / "gold_evidence.csv")
                 gold_fields_df = ragas_eval.load_gold_fields_jsonl(paths.eval_dir / "gold_fields.jsonl")
 
-                doc_names = sorted(set(
-                    questions_df.loc[questions_df["doc_id"] != "*", "doc_id"].astype(str).tolist()
-                ))
-                missing = [name for name in doc_names if not (paths.pdf_dir / name).exists()]
+                doc_names = sorted(set(questions_df.loc[questions_df["doc_id"] != "*", "doc_id"].astype(str).tolist()))
                 run_docs = [paths.pdf_dir / name for name in doc_names if (paths.pdf_dir / name).exists()]
-
                 if not run_docs:
-                    raise RuntimeError("평가 문서가 없습니다. questions.csv doc_id 와 data/raw/files 매칭 확인")
-
-                if missing:
-                    st.warning(f"questions.csv에 있지만 PDF가 없는 문서가 {len(missing)}개 있습니다.")
-                    st.caption("예: " + ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else ""))
+                    raise RuntimeError("평가 문서가 없습니다.")
 
                 client = cached_openai_client(api_key)
                 embed_model = cached_embed_model("BAAI/bge-m3")
 
-                spec = rag_experiment.ExperimentSpec(
-                    exp_id=0,
-                    chunker=str(eval_chunker),
-                    retriever=str(eval_retriever),
-                    generator=str(eval_generator),
-                )
-
-                chunker_obj, retriever_obj, gen_obj = rag_experiment.make_components(
-                    spec, embed_model=embed_model, client=client
-                )
+                spec = rag_experiment.ExperimentSpec(exp_id=0, chunker=str(eval_chunker), retriever=str(eval_retriever), generator=str(eval_generator))
+                chunker_obj, retriever_obj, gen_obj = rag_experiment.make_components(spec, embed_model=embed_model, client=client)
                 exp = rag_experiment.RAGExperiment(chunker_obj, retriever_obj, gen_obj, questions_df)
 
-                ctx_k = int(eval_context_k)
-                ret_k = int(eval_recall_k)
-                if ret_k < ctx_k:
-                    ret_k = ctx_k
+                rtv = int(eval_retrieve_k)
+                ctx = int(eval_context_k)
+                rcl = int(eval_recall_k)
+                need = max(ctx, rcl)
+                if rtv < need:
+                    rtv = need
 
-                rows: List[Dict[str, Any]] = []
-                failed: List[Dict[str, Any]] = []
-
+                rows = []
                 for dp in run_docs:
-                    try:
-                        m = exp.run_single_doc_metrics(
-                            doc_path=Path(dp),
-                            gold_fields_df=gold_fields_df,
-                            gold_evidence_df=gold_evidence_df,
-                            context_k=ctx_k,
-                            recall_k=ret_k,
-                            sim_threshold=int(eval_sim_threshold),
-                        )
-                        m["chunker"] = spec.chunker
-                        m["retriever"] = spec.retriever
-                        m["generator"] = spec.generator
-                        m["context_k"] = int(ctx_k)
-                        m["recall_k"] = int(ret_k)
-                        rows.append(m)
-                    except Exception as e:
-                        failed.append({"doc_id": Path(dp).name, "error": repr(e)})
-
-                if not rows:
-                    raise RuntimeError(
-                        "모든 문서 평가가 실패해서 결과가 비었습니다.\n"
-                        f"실패 {len(failed)}개. failed[0]={failed[0] if failed else None}"
+                    m = exp.run_single_doc_metrics(
+                        doc_path=Path(dp),
+                        gold_fields_df=gold_fields_df,
+                        gold_evidence_df=gold_evidence_df,
+                        retrieve_k=rtv,
+                        context_k=ctx,
+                        recall_k=rcl,
+                        sim_threshold=int(eval_sim_threshold),
                     )
+                    m["chunker"] = spec.chunker
+                    m["retriever"] = spec.retriever
+                    m["generator"] = spec.generator
+                    rows.append(m)
 
                 doc_metrics_df = pd.DataFrame(rows)
                 doc_metrics_df = standardize_eval_columns(doc_metrics_df)
 
                 ragas_doc_df = None
                 ragas_exp_df = None
-
                 if run_ragas:
                     ragas_res = ragas_eval.run_experiment_with_ragas(
                         spec=spec,
@@ -909,11 +754,11 @@ with tab_exp_eval:
                         embed_model=embed_model,
                         client=client,
                         evaluator_model=judge_model,
-                        ragas_metrics=["faithfulness", "context_precision", "answer_correctness"],
                         compute_baseline_doc_metrics=False,
                         gold_evidence_df=gold_evidence_df,
                         sim_threshold=int(eval_sim_threshold),
-                        context_k=int(ctx_k),
+                        retrieve_k=rtv,
+                        context_k=ctx,
                         judge_max_context_chars_per_sample=int(eval_max_context_chars),
                         judge_max_output_tokens=500,
                         judge_reasoning_effort="minimal",
@@ -924,56 +769,25 @@ with tab_exp_eval:
                 merged_df = merge_eval_and_ragas(doc_metrics_df, ragas_doc_df)
                 mean_df = make_mean_table(merged_df)
 
-                st.session_state["eval_doc_metrics_df"] = doc_metrics_df
-                st.session_state["eval_ragas_doc_df"] = ragas_doc_df
-                st.session_state["eval_ragas_exp_df"] = ragas_exp_df
                 st.session_state["eval_merged_df"] = merged_df
                 st.session_state["eval_mean_df"] = mean_df
-                st.session_state["eval_failed_docs"] = pd.DataFrame(failed) if failed else pd.DataFrame()
-                st.session_state["eval_ctx_k"] = int(ctx_k)
-                st.session_state["eval_ret_k"] = int(ret_k)
+                st.session_state["eval_ragas_exp_df"] = ragas_exp_df
 
                 status.update(label=f"평가 완료 ✅ ({time.time()-t0:.2f}s)", state="complete")
-
             except Exception as e:
                 status.update(label="평가 실패 ❌", state="error")
                 st.error("평가 실행 중 오류")
                 st.exception(e)
 
     st.divider()
-    st.subheader("✅ 평가 결과 (문서별 + 평균)")
-
-    failed_df = st.session_state.get("eval_failed_docs")
-    if failed_df is not None and len(failed_df) > 0:
-        st.warning(f"실패 문서 {len(failed_df)}개")
-        st.dataframe(failed_df, use_container_width=True)
-
+    st.subheader("✅ 평가 결과")
     merged_df = st.session_state.get("eval_merged_df")
     if merged_df is not None:
-        ctx_k = st.session_state.get("eval_ctx_k", None)
-        ret_k = st.session_state.get("eval_ret_k", None)
-        if ctx_k is not None and ret_k is not None:
-            st.caption(f"현재 평가 설정: context_K={ctx_k}, recall_K={ret_k} (ret_recall/ret_mrr은 recall_K 기준)")
-
-        preferred = [
-            "doc_id",
-            "context_k", "recall_k",
-            "ret_recall", "ret_mrr", "gen_fill", "gen_match", "gen_sim",
-            "faithfulness", "context_precision", "answer_correctness",
-            "chunker", "retriever", "generator",
-        ]
-        cols = [c for c in preferred if c in merged_df.columns] + [c for c in merged_df.columns if c not in preferred]
-        st.dataframe(merged_df[cols], use_container_width=True)
-    else:
-        st.caption("아직 평가 결과가 없습니다.")
-
-    st.subheader("📌 전체 평균표")
+        st.dataframe(merged_df, use_container_width=True)
     mean_df = st.session_state.get("eval_mean_df")
     if mean_df is not None and len(mean_df) > 0:
+        st.subheader("📌 전체 평균표")
         st.dataframe(mean_df, use_container_width=True)
-    else:
-        st.caption("평균표 없음(미실행 또는 지표 컬럼 없음).")
-
     ragas_exp_df = st.session_state.get("eval_ragas_exp_df")
     if ragas_exp_df is not None and isinstance(ragas_exp_df, pd.DataFrame) and len(ragas_exp_df) > 0:
         st.subheader("참고: RAGAS exp 평균")

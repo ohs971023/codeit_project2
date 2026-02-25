@@ -91,3 +91,16 @@
   - 해석
     - 문서 구조가 복잡하거나 정답이 표/서식/여러 페이지에 분산
     - chunk 전략 / Docling / 구조 기반 파싱 필요
+
+
+## 3-K
+retrieve_K ≥ recall_K ≥ context_K
+
+### retrieve_K
+- 실제로 검색기에서 몇 개를 뽑을지
+
+### recall_K
+- 그중 상위 K개 안에 정답이 있었는지 평가
+
+### context_K
+- LLM에게 실제로 넣는 개수

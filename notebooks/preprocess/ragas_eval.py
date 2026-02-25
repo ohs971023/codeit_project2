@@ -21,9 +21,6 @@ from preprocess.rag_experiment import (
     get_queries_for_doc,
 )
 
-# ------------------------------------------------------------
-# Gold loader (fields.jsonl -> long df)
-# ------------------------------------------------------------
 def load_gold_fields_jsonl(path: str | Path) -> pd.DataFrame:
     path = Path(path)
     rows = []
@@ -46,7 +43,6 @@ def load_gold_fields_jsonl(path: str | Path) -> pd.DataFrame:
             out.append({"instance_id": iid, "doc_id": doc_id, "field": str(k), "gold": v})
     return pd.DataFrame(out)
 
-
 def _gold_map_for_doc(gold_fields_df: pd.DataFrame, doc_name: str) -> Dict[str, str]:
     qdf = gold_fields_df[gold_fields_df["doc_id"].astype(str) == str(doc_name)].copy()
     m: Dict[str, str] = {}
@@ -60,10 +56,9 @@ def _gold_map_for_doc(gold_fields_df: pd.DataFrame, doc_name: str) -> Dict[str, 
             m[field] = gold_s
     return m
 
-
 def _dedupe_ints_keep_order(xs: List[int]) -> List[int]:
     seen = set()
-    out = []
+    out: List[int] = []
     for x in xs or []:
         try:
             xi = int(x)
@@ -75,10 +70,6 @@ def _dedupe_ints_keep_order(xs: List[int]) -> List[int]:
         out.append(xi)
     return out
 
-
-# ------------------------------------------------------------
-# Build RAGAS-style rows
-# ------------------------------------------------------------
 def build_ragas_rows_for_doc(
     doc_path: Path,
     questions_df: pd.DataFrame,
@@ -86,7 +77,9 @@ def build_ragas_rows_for_doc(
     chunker,
     retriever,
     generator,
-    top_k: int,
+    *,
+    retrieve_k: int,
+    context_k: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     doc_name = unicodedata.normalize("NFC", doc_path.name)
     queries: List[Tuple[str, str]] = get_queries_for_doc(doc_name, questions_df)
@@ -97,10 +90,12 @@ def build_ragas_rows_for_doc(
 
     chunks: List[str] = chunker.chunk(doc_path)
     index = retriever.build_index(chunks)
-    idxs: List[int] = retriever.retrieve(index, q_texts, top_k=int(top_k))
+
+    idxs: List[int] = retriever.retrieve(index, q_texts, top_k=int(retrieve_k))
     idxs = _dedupe_ints_keep_order(idxs)
 
-    contexts: List[str] = [chunks[int(i)] for i in idxs if 0 <= int(i) < len(chunks)]
+    ctx_idxs = idxs[: int(context_k)]
+    contexts: List[str] = [chunks[int(i)] for i in ctx_idxs if 0 <= int(i) < len(chunks)]
 
     pred_map: Dict[str, str] = generator.generate(queries, "".join(contexts))
     gold_map = _gold_map_for_doc(gold_fields_df, doc_name)
@@ -121,7 +116,8 @@ def build_ragas_rows_for_doc(
     doc_meta = {
         "doc_id": doc_name,
         "chunk_count": int(len(chunks)),
-        "top_k": int(top_k),
+        "retrieve_k": int(retrieve_k),
+        "context_k": int(context_k),
         "contexts_count": int(len(contexts)),
         "contexts_joined_len": int(sum(len(c) for c in contexts)),
         "n_questions": int(len(queries)),
@@ -130,9 +126,6 @@ def build_ragas_rows_for_doc(
     return rows, doc_meta
 
 
-# ------------------------------------------------------------
-# GPT-5 evaluator (Responses API)
-# ------------------------------------------------------------
 JUDGE_PROMPT = """너는 RAG 시스템 답변을 평가하는 엄격한 평가자다.
 아래 입력을 보고, JSON 형식으로만 평가 결과를 출력하라. 설명/코드블록/추가 텍스트 금지.
 
@@ -148,11 +141,11 @@ JUDGE_PROMPT = """너는 RAG 시스템 답변을 평가하는 엄격한 평가�
 - answer_correctness는 reference가 비어있으면 반드시 null로 출력하라.
 
 출력 JSON 스키마(키 고정):
-{{
+{
   "faithfulness": <number 0..1>,
   "context_precision": <number 0..1>,
   "answer_correctness": <number 0..1 or null>
-}}
+}
 
 INPUT:
 user_input: {user_input}
@@ -162,7 +155,6 @@ retrieved_contexts:
 {retrieved_contexts}
 """
 
-
 def _clip01(x: Any) -> Optional[float]:
     try:
         if x is None:
@@ -170,14 +162,9 @@ def _clip01(x: Any) -> Optional[float]:
         v = float(x)
         if v != v:
             return None
-        if v < 0.0:
-            return 0.0
-        if v > 1.0:
-            return 1.0
-        return v
+        return max(0.0, min(1.0, v))
     except Exception:
         return None
-
 
 def run_ragas_gpt5(
     rows: List[Dict[str, Any]],
@@ -192,12 +179,10 @@ def run_ragas_gpt5(
         "doc_id", "field", "user_input",
         "faithfulness", "context_precision", "answer_correctness",
     ]
-
     if not rows:
         return pd.DataFrame(columns=expected_cols)
 
     out_rows: List[Dict[str, Any]] = []
-
     for r in tqdm(rows, desc="GPT-5 judge scoring"):
         user_input = str(r.get("user_input", ""))
         response = str(r.get("response", ""))
@@ -205,8 +190,7 @@ def run_ragas_gpt5(
         ref_s = "" if reference is None else str(reference)
 
         ctx_list = r.get("retrieved_contexts", []) or []
-        ctx_joined = "\n\n".join([str(x) for x in ctx_list])
-        ctx_joined = ctx_joined[:max_context_chars_per_sample]
+        ctx_joined = "\n\n".join([str(x) for x in ctx_list])[:max_context_chars_per_sample]
 
         prompt = JUDGE_PROMPT.format(
             user_input=user_input,
@@ -218,7 +202,6 @@ def run_ragas_gpt5(
         faith = None
         cprec = None
         acorr = None
-
         try:
             resp = client.responses.create(
                 model=evaluator_model,
@@ -231,9 +214,8 @@ def run_ragas_gpt5(
 
             faith = _clip01(obj.get("faithfulness"))
             cprec = _clip01(obj.get("context_precision"))
-            acorr = obj.get("answer_correctness")
-            acorr = None if acorr is None else _clip01(acorr)
-
+            ac = obj.get("answer_correctness")
+            acorr = None if ac is None else _clip01(ac)
         except Exception:
             pass
 
@@ -259,9 +241,6 @@ def run_ragas_gpt5(
     return df[expected_cols].copy()
 
 
-# ------------------------------------------------------------
-# Result container
-# ------------------------------------------------------------
 @dataclass
 class RagasRunResult:
     doc_metrics_df: pd.DataFrame
@@ -270,9 +249,6 @@ class RagasRunResult:
     ragas_exp_df: pd.DataFrame
 
 
-# ------------------------------------------------------------
-# Main entry
-# ------------------------------------------------------------
 def run_experiment_with_ragas(
     spec: ExperimentSpec,
     run_docs: List[str | Path],
@@ -284,7 +260,8 @@ def run_experiment_with_ragas(
     compute_baseline_doc_metrics: bool = True,
     gold_evidence_df: Optional[pd.DataFrame] = None,
     sim_threshold: int = 80,
-    # ✅ 추가: RAGAS 컨텍스트 K
+    # ✅ 3-K: RAGAS는 retrieve_k / context_k만 받으면 됨(지표는 없으니까)
+    retrieve_k: Optional[int] = None,
     context_k: Optional[int] = None,
     # judge 옵션
     judge_max_context_chars_per_sample: int = 6000,
@@ -294,18 +271,15 @@ def run_experiment_with_ragas(
     if ragas_metrics is None:
         ragas_metrics = ["faithfulness", "context_precision", "answer_correctness"]
 
-    allowed = {"faithfulness", "context_precision", "answer_correctness"}
-    bad = [m for m in ragas_metrics if m not in allowed]
-    if bad:
-        raise ValueError(f"Unsupported metrics {bad}. Allowed: {sorted(allowed)}")
-
     questions_df = load_questions_df()
     gold_fields_df = load_gold_fields_jsonl(gold_fields_jsonl_path)
 
     chunker, retriever, generator = make_components(spec, embed_model=embed_model, client=client)
 
-    # ✅ CONFIG top_k가 아니라, 외부에서 넘어온 context_k를 우선 사용
-    top_k = int(context_k) if context_k is not None else int(CONFIG.get("top_k", 15))
+    ctx_k = int(context_k) if context_k is not None else 8
+    rtv_k = int(retrieve_k) if retrieve_k is not None else max(ctx_k, int(CONFIG.get("top_k", 15)))
+    if rtv_k < ctx_k:
+        rtv_k = ctx_k
 
     all_rows: List[Dict[str, Any]] = []
     for dp in tqdm([Path(p) for p in run_docs], desc=f"RAG + RAGAS | exp {spec.exp_id}"):
@@ -316,7 +290,8 @@ def run_experiment_with_ragas(
             chunker=chunker,
             retriever=retriever,
             generator=generator,
-            top_k=top_k,
+            retrieve_k=rtv_k,
+            context_k=ctx_k,
         )
         for r in rows:
             r["exp_id"] = spec.exp_id
@@ -350,7 +325,7 @@ def run_experiment_with_ragas(
 
     if compute_baseline_doc_metrics:
         if gold_evidence_df is None:
-            raise ValueError("compute_baseline_doc_metrics=True면 gold_evidence_df를 넘겨줘야 함")
+            raise ValueError("compute_baseline_doc_metrics=True면 gold_evidence_df 필요")
 
         from preprocess.rag_experiment import RAGExperiment
         rag = RAGExperiment(chunker=chunker, retriever=retriever, generator=generator, questions_df=questions_df)
@@ -361,7 +336,9 @@ def run_experiment_with_ragas(
                 Path(dp),
                 gold_fields_df=gold_fields_df,
                 gold_evidence_df=gold_evidence_df,
-                top_k=top_k,
+                retrieve_k=rtv_k,
+                context_k=ctx_k,
+                recall_k=max(ctx_k, int(CONFIG.get("top_k", 15))),  # fallback
                 sim_threshold=sim_threshold,
             )
             m["exp_id"] = spec.exp_id
