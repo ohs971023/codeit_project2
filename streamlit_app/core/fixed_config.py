@@ -2,15 +2,16 @@
 # Do not edit manually unless you know what you're doing.
 
 CONFIG = {
-  "service_chunk_mode": "runtime_c1",
-  "pp_version": "pp_v5",
-  "chunk_length": 1200,
-  "service_retrieve_k": 30,
-  "service_context_k": 8,
-  "service_recall_k": 20,
-  "alpha": 0.7,
-  "max_completion_tokens": 800,
-  "temperature": 0.1,
-  "max_context_chars": 2500,
-  "top_k": 8
+    "service_chunk_mode": "precomputed",
+    "pp_version": "pp_v5",
+    "chunk_length": 1200,
+    "service_retrieve_k": 20,
+    "service_context_k": 16,
+    "service_recall_k": 20,
+    "alpha": 0.7,
+    "max_tokens": 2000,
+    "max_completion_tokens": 2496,
+    "temperature": 0.1,
+    "max_context_chars": 4100,
+    "top_k": 16
 }

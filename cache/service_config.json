@@ -1,12 +1,16 @@
 {
+  "service_chunk_mode": "precomputed",
   "pp_version": "pp_v5",
   "chunk_length": 1200,
-  "top_k": 20,
+  "service_retrieve_k": 20,
+  "service_context_k": 16,
+  "service_recall_k": 20,
   "alpha": 0.7,
   "max_context_chars": 4100,
   "max_completion_tokens": 2496,
   "temperature": 0.1,
   "confirmed_max": 1,
   "candidate_max": 12,
-  "max_pages_scan": 260
+  "max_pages_scan": 260,
+  "top_k": 16
 }
