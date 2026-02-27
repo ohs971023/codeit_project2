@@ -83,29 +83,30 @@ def build_ragas_rows_for_doc(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     doc_name = unicodedata.normalize("NFC", doc_path.name)
     queries: List[Tuple[str, str]] = get_queries_for_doc(doc_name, questions_df)
-    q_texts = [q for _t, q in queries]
 
     if not queries:
         return [], {"doc_id": doc_name, "n_questions": 0, "skipped": "no_queries"}
 
     chunks: List[str] = chunker.chunk(doc_path)
     index = retriever.build_index(chunks)
-
-    idxs: List[int] = retriever.retrieve(index, q_texts, top_k=int(retrieve_k))
-    idxs = _dedupe_ints_keep_order(idxs)
-
-    ctx_idxs = idxs[: int(context_k)]
-    contexts: List[str] = [chunks[int(i)] for i in ctx_idxs if 0 <= int(i) < len(chunks)]
-
-    pred_map: Dict[str, str] = generator.generate(queries, "".join(contexts))
     gold_map = _gold_map_for_doc(gold_fields_df, doc_name)
 
     rows: List[Dict[str, Any]] = []
+    contexts_count_list: List[int] = []
+    contexts_joined_len_list: List[int] = []
     for field, question in queries:
+        idxs: List[int] = retriever.retrieve(index, [question], top_k=int(retrieve_k))
+        idxs = _dedupe_ints_keep_order(idxs)
+        ctx_idxs = idxs[: int(context_k)]
+        contexts: List[str] = [chunks[int(i)] for i in ctx_idxs if 0 <= int(i) < len(chunks)]
+        one_pred = generator.generate([(field, question)], "".join(contexts))
+
+        contexts_count_list.append(int(len(contexts)))
+        contexts_joined_len_list.append(int(sum(len(c) for c in contexts)))
         rows.append(
             {
                 "user_input": str(question),
-                "response": (pred_map.get(field, "") or "").strip(),
+                "response": (one_pred.get(field, "") or "").strip(),
                 "retrieved_contexts": contexts,
                 "reference": gold_map.get(str(field), None),
                 "doc_id": doc_name,
@@ -118,8 +119,8 @@ def build_ragas_rows_for_doc(
         "chunk_count": int(len(chunks)),
         "retrieve_k": int(retrieve_k),
         "context_k": int(context_k),
-        "contexts_count": int(len(contexts)),
-        "contexts_joined_len": int(sum(len(c) for c in contexts)),
+        "contexts_count_avg": float(sum(contexts_count_list) / len(contexts_count_list)) if contexts_count_list else 0.0,
+        "contexts_joined_len_avg": float(sum(contexts_joined_len_list) / len(contexts_joined_len_list)) if contexts_joined_len_list else 0.0,
         "n_questions": int(len(queries)),
         "max_context_chars": int(CONFIG.get("max_context_chars", 0)),
     }
