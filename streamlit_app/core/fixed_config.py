@@ -30,4 +30,5 @@ CONFIG = {'service_chunk_mode': 'runtime_c1',
  'hl_window': 30,
  'hl_max_phrases': 2,
  'hl_max_token': 8,
- 'hl_min_score': 2}
+ 'hl_min_score': 2,
+ 'enable_hl_fallback_keywords': True}

@@ -104,3 +104,6 @@ retrieve_K ≥ recall_K ≥ context_K
 
 ### context_K
 - LLM에게 실제로 넣는 개수
+
+
+https://blog.naver.com/ohs3201

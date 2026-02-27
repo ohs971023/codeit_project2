@@ -21,6 +21,7 @@
   "hl_max_phrases": 2,
   "hl_max_token": 8,
   "hl_min_score": 2,
+  "enable_hl_fallback_keywords": true,
   "reasoning_effort": "medium",
   "generator_retries": 1,
   "fallback_model": "gpt-4.1-mini",
